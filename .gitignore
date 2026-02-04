@@ -1,2 +1,4 @@
 aslapp-484203-25c5e917cbca.json
 .env
+**/__pycache__/
+*.pyc
