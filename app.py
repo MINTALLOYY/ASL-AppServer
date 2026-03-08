@@ -1,3 +1,7 @@
+# Gevent monkey-patch MUST come first before any other imports
+from gevent import monkey
+monkey.patch_all()
+
 import json
 import os
 import tempfile
