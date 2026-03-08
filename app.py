@@ -80,6 +80,51 @@ def health():
     return jsonify({"status": "server running but no credentials"}), 500
 
 
+@app.get("/ws-info")
+def ws_info():
+    """
+    Returns WebSocket connection info for debugging.
+    """
+    host = request.host
+    # Build the correct WebSocket URL (no port for production, wss for https)
+    if request.is_secure or "onrender.com" in host:
+        ws_scheme = "wss"
+    else:
+        ws_scheme = "ws"
+    
+    # Remove any port from host for production
+    if "onrender.com" in host:
+        host = host.split(":")[0]  # Strip port if present
+    
+    return jsonify({
+        "ws_echo_url": f"{ws_scheme}://{host}/ws/echo",
+        "ws_speech_url": f"{ws_scheme}://{host}/speech/ws",
+        "request_host": request.host,
+        "is_secure": request.is_secure,
+    })
+
+
+@sock.route("/ws/echo")
+def ws_echo(ws):
+    """
+    Simple WebSocket echo test endpoint.
+    Connect to wss://yourserver/ws/echo and send any message to get it echoed back.
+    """
+    logger.info("WebSocket ECHO connection opened")
+    try:
+        while True:
+            msg = ws.receive()
+            if msg is None:
+                logger.info("WebSocket ECHO client disconnected")
+                break
+            logger.info("WebSocket ECHO received: %s", msg[:100] if msg else None)
+            ws.send(f"echo: {msg}")
+    except Exception as e:
+        logger.exception("WebSocket ECHO error: %s", e)
+    finally:
+        logger.info("WebSocket ECHO connection closed")
+
+
 @app.post("/speech/finalize")
 def speech_finalize():
     """
