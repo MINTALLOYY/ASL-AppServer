@@ -1,6 +1,7 @@
 import base64
 import queue
 import threading
+import traceback
 from typing import Generator, Optional
 
 from google.cloud import speech_v1 as speech
@@ -39,9 +40,19 @@ class ChirpStreamer:
             b64: Base64-encoded audio data (16 kHz, 16-bit mono PCM).
         """
         try:
-            self._audio_q.put(base64.b64decode(b64), block=False)
-        except Exception:
-            pass
+            if not b64:
+                print("[DEBUG] add_audio_base64 called with empty data")
+                return
+            decoded = base64.b64decode(b64)
+            self._audio_q.put(decoded, block=False)
+            try:
+                qsize = self._audio_q.qsize()
+            except Exception:
+                qsize = "unknown"
+            print(f"[DEBUG] Enqueued audio chunk size={len(decoded)} bytes, queue_size={qsize}")
+        except Exception as e:
+            print(f"[ERROR] Failed to add audio base64: {e}")
+            print(traceback.format_exc())
 
     def finish(self) -> None:
         """Signal that no more audio will be sent; close the stream gracefully."""
@@ -116,6 +127,7 @@ class ChirpStreamer:
             return response_iterator
         except Exception as e:
             print(f"[ERROR] Error in streaming_recognize: {e}")
+            print(traceback.format_exc())
             raise
 
 
@@ -134,8 +146,14 @@ def speaker_label_from_result(result: speech.StreamingRecognitionResult) -> Opti
         if alt.words:
             tag = alt.words[-1].speaker_tag
             if tag:
-                base = ord('A') - 1
-                return f"Speaker {chr(base + int(tag))}"
+                try:
+                    base = ord('A') - 1
+                    label = f"Speaker {chr(base + int(tag))}"
+                    print(f"[DEBUG] speaker_label_from_result: tag={tag} -> {label}")
+                    return label
+                except Exception:
+                    print(f"[DEBUG] speaker_label_from_result: invalid tag={tag}")
+                    pass
     except Exception:
         pass
     return None
