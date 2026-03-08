@@ -14,7 +14,7 @@ workers = 1
 # Disable worker timeout so WebSocket connections aren't killed
 timeout = 0
 
-# Graceful shutdown window
+# Graceful shutdown window 
 graceful_timeout = 30
 
 # Bind to Render's PORT
