@@ -1,6 +1,6 @@
-# Gevent monkey-patch MUST come first before any other imports
-from gevent import monkey
-monkey.patch_all()
+# Eventlet monkey-patch MUST come first before any other imports
+import eventlet
+eventlet.monkey_patch()
 
 import json
 import os
