@@ -8,12 +8,22 @@ import traceback
 from dotenv import load_dotenv
 from flask import Flask, jsonify, request
 from flask_sock import Sock
+import logging
+import sys
 
 from firebase.db import FirestoreDB
 from speech.chirp_stream import ChirpStreamer, speaker_label_from_result
 from asl.asl_inference import transcribe_video
 
 load_dotenv()
+
+# Configure structured logging to stdout (suitable for Render)
+logging.basicConfig(
+    level=logging.DEBUG,
+    format="[%(asctime)s] %(levelname)s %(name)s: %(message)s",
+    stream=sys.stdout,
+)
+logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 sock = Sock(app)
@@ -145,7 +155,7 @@ def speech_ws(ws):
         remote = request.remote_addr
     except Exception:
         remote = None
-    print(f"[DEBUG] WebSocket connection opened. conversation_id={conversation_id}, remote={remote}")
+    logger.info("WebSocket connection opened. conversation_id=%s, remote=%s", conversation_id, remote)
 
     # Background thread: consume responses from Google Speech and send to client
     def consume_responses():
@@ -153,14 +163,14 @@ def speech_ws(ws):
             response_count = 0
             print("[DEBUG] consume_responses started. Waiting for responses...")
             for response in streamer_state["streamer"].responses():
-                response_count += 1
-                try:
-                    results_len = len(response.results)
-                except Exception:
-                    results_len = "unknown"
-                print(f"[DEBUG] Received response #{response_count}. Results count: {results_len}")
-                if results_len == 0:
-                    print(f"[DEBUG] Response had no results: {response}")
+                    response_count += 1
+                    try:
+                        results_len = len(response.results)
+                    except Exception:
+                        results_len = "unknown"
+                    logger.debug("Received response #%s. Results count: %s", response_count, results_len)
+                    if results_len == 0:
+                        logger.debug("Response had no results: %s", response)
                 for result in response.results:
                     if result.is_final:
                         try:
@@ -176,11 +186,11 @@ def speech_ws(ws):
                                     "text": transcript,
                                     "speaker": speaker
                                 })
-                                print(f"[DEBUG] Sending message: {message}")  # Debug log for sent message
+                                logger.debug("Sending message: %s", message)
                                 ws.send(message)
                             except Exception as e:
-                                print(f"[ERROR] WebSocket send error: {e}")  # Debug log for WebSocket error
-                                print(traceback.format_exc())
+                                logger.error("WebSocket send error: %s", e)
+                                logger.error(traceback.format_exc())
                                 streamer_state["streamer"].finish()
                                 return
                             try:
@@ -204,13 +214,13 @@ def speech_ws(ws):
         while True:
             msg = ws.receive()
             if msg is None:
-                print("[DEBUG] WebSocket receive returned None — client disconnected")
+                logger.info("WebSocket receive returned None — client disconnected")
                 break
             try:
                 data = json.loads(msg)
             except Exception:
                 try:
-                    print(f"[DEBUG] Received non-JSON message: {repr(msg)[:200]}")
+                    logger.debug("Received non-JSON message: %s", repr(msg)[:200])
                 except Exception:
                     pass
                 continue
@@ -223,7 +233,12 @@ def speech_ws(ws):
                     b64_len = len(b64) if b64 is not None else 0
                 except Exception:
                     b64_len = "unknown"
-                print(f"[DEBUG] event=audio_chunk conversation_id={conversation_id} b64_len={b64_len} streamer_active={streamer_state['active']}")
+                logger.debug(
+                    "event=audio_chunk conversation_id=%s b64_len=%s streamer_active=%s",
+                    conversation_id,
+                    b64_len,
+                    streamer_state["active"],
+                )
                 if not conversation_id:
                     cid = data.get("conversation_id")
                     if cid:
@@ -251,7 +266,7 @@ def speech_ws(ws):
                     cid = data.get("conversation_id")
                     if cid:
                         conversation_id = cid
-                print(f"[DEBUG] event={event} — finishing streamer for conversation_id={conversation_id}")
+                logger.info("event=%s — finishing streamer for conversation_id=%s", event, conversation_id)
                 streamer_state["streamer"].finish()
                 break
             elif event == "set_conversation":
@@ -259,13 +274,12 @@ def speech_ws(ws):
                 cid = data.get("conversation_id")
                 if cid:
                     conversation_id = cid
-                    print(f"[DEBUG] set_conversation updated conversation_id={conversation_id}")
+                    logger.debug("set_conversation updated conversation_id=%s", conversation_id)
             else:
                 # Ignore unknown events
-                print(f"[DEBUG] Unknown websocket event received: {event}")
+                logger.debug("Unknown websocket event received: %s", event)
     except Exception:
-        print("[ERROR] Exception in WebSocket main loop")
-        print(traceback.format_exc())
+        logger.exception("Exception in WebSocket main loop")
     finally:
         # Clean up streaming resources
         try:
@@ -276,7 +290,7 @@ def speech_ws(ws):
             t.join(timeout=2)
         except Exception:
             pass
-        print(f"[DEBUG] WebSocket handler cleanup complete for conversation_id={conversation_id}")
+        logger.debug("WebSocket handler cleanup complete for conversation_id=%s", conversation_id)
 
 
 # Run the Flask app
