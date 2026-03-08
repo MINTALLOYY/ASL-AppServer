@@ -17,12 +17,22 @@ from asl.asl_inference import transcribe_video
 
 load_dotenv()
 
-# Configure structured logging to stdout (suitable for Render)
+# Configure structured logging to stdout (Render + Gunicorn)
 logging.basicConfig(
     level=logging.DEBUG,
     format="[%(asctime)s] %(levelname)s %(name)s: %(message)s",
     stream=sys.stdout,
+    force=True,
 )
+root_logger = logging.getLogger()
+root_logger.setLevel(logging.DEBUG)
+
+# When running under Gunicorn, reuse its handlers so logs show up
+gunicorn_error_logger = logging.getLogger("gunicorn.error")
+if gunicorn_error_logger.handlers:
+    root_logger.handlers = gunicorn_error_logger.handlers
+    root_logger.setLevel(gunicorn_error_logger.level)
+
 logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
