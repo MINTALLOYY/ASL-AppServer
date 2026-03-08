@@ -232,11 +232,20 @@ def speech_ws(ws):
     # Start response consumer in background
     t = threading.Thread(target=consume_responses, daemon=True)
     t.start()
+    logger.info("consume_responses thread started. thread=%s alive=%s", t.name, t.is_alive())
 
     # Main loop: receive audio chunks from Flutter client
+    logger.info("Entering WebSocket main loop. Waiting for messages from client...")
+    msg_count = 0
     try:
         while True:
+            msg_count += 1
+            if msg_count <= 3:
+                logger.debug("ws.receive() call #%s - waiting for client message...", msg_count)
             msg = ws.receive()
+            if msg_count <= 5:
+                logger.debug("ws.receive() returned. msg_count=%s msg_type=%s msg_len=%s", 
+                            msg_count, type(msg).__name__, len(msg) if msg else 0)
             if msg is None:
                 logger.info("WebSocket receive returned None — client disconnected")
                 break
