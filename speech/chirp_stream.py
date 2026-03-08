@@ -85,7 +85,7 @@ class ChirpStreamer:
             interim_results=False,
             single_utterance=False,
         )
-        print(f"[DEBUG] Streaming config created: {streaming_config}")
+        logger.debug("Streaming config created: %s", streaming_config)
         return streaming_config
 
     def _request_generator(self) -> Generator[speech.StreamingRecognizeRequest, None, None]:
@@ -105,10 +105,15 @@ class ChirpStreamer:
                 if chunk:
                     audio_passed = True
                     chunk_count += 1
-                    print(f"[DEBUG] Sending audio chunk #{chunk_count} of size: {len(chunk)} bytes. Queue size: {self._audio_q.qsize()}")
+                    logger.debug(
+                        "Sending audio chunk #%s of size: %s bytes. Queue size: %s",
+                        chunk_count,
+                        len(chunk),
+                        self._audio_q.qsize(),
+                    )
                     yield speech.StreamingRecognizeRequest(audio_content=chunk)
             except queue.Empty:
-                    logger.debug("Queue empty. _finished=%s, queue_empty=%s", self._finished.is_set(), self._audio_q.empty())
+                logger.debug("Queue empty. _finished=%s, queue_empty=%s", self._finished.is_set(), self._audio_q.empty())
                 continue
 
         logger.debug("_request_generator finished. Total chunks sent: %s. Audio passed: %s", chunk_count, audio_passed)
