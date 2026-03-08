@@ -161,16 +161,16 @@ def speech_ws(ws):
     def consume_responses():
         try:
             response_count = 0
-            print("[DEBUG] consume_responses started. Waiting for responses...")
+            logger.debug("consume_responses started. Waiting for responses...")
             for response in streamer_state["streamer"].responses():
-                    response_count += 1
-                    try:
-                        results_len = len(response.results)
-                    except Exception:
-                        results_len = "unknown"
-                    logger.debug("Received response #%s. Results count: %s", response_count, results_len)
-                    if results_len == 0:
-                        logger.debug("Response had no results: %s", response)
+                response_count += 1
+                try:
+                    results_len = len(response.results)
+                except Exception:
+                    results_len = "unknown"
+                logger.debug("Received response #%s. Results count: %s", response_count, results_len)
+                if results_len == 0:
+                    logger.debug("Response had no results: %s", response)
                 for result in response.results:
                     if result.is_final:
                         try:
@@ -197,10 +197,11 @@ def speech_ws(ws):
                                 if conversation_id and db:
                                     db.save_message(conversation_id=conversation_id, text=transcript, source="speech", speaker=speaker)
                             except Exception as e:
-                                print(f"Firestore save error: {e}")  # Debug log for Firestore error
-            print(f"[DEBUG] consume_responses finished. Total responses: {response_count}")
+                                logger.error("Firestore save error: %s", e)
+            logger.debug("consume_responses finished. Total responses: %s", response_count)
         except Exception as e:
-            print(f"Error in consume_responses: {e}")  # Debug log for consume_responses error
+            logger.error("Error in consume_responses: %s", e)
+            logger.error(traceback.format_exc())
             # If the stream errored due to audio timeout, mark inactive so we can restart on next audio
             if "Audio Timeout" in str(e) or "Audio Timeout Error" in str(e):
                 streamer_state["active"] = False
