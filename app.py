@@ -3,6 +3,7 @@ import os
 import tempfile
 import threading
 from typing import Optional
+import traceback
 
 from dotenv import load_dotenv
 from flask import Flask, jsonify, request
@@ -139,6 +140,13 @@ def speech_ws(ws):
     # Initialize Google Speech streaming client (with restart capability)
     streamer_state = {"streamer": ChirpStreamer(), "active": True}
 
+    # Log when a new WebSocket connection opens
+    try:
+        remote = request.remote_addr
+    except Exception:
+        remote = None
+    print(f"[DEBUG] WebSocket connection opened. conversation_id={conversation_id}, remote={remote}")
+
     # Background thread: consume responses from Google Speech and send to client
     def consume_responses():
         try:
@@ -146,7 +154,13 @@ def speech_ws(ws):
             print("[DEBUG] consume_responses started. Waiting for responses...")
             for response in streamer_state["streamer"].responses():
                 response_count += 1
-                print(f"[DEBUG] Received response #{response_count}. Results count: {len(response.results)}")
+                try:
+                    results_len = len(response.results)
+                except Exception:
+                    results_len = "unknown"
+                print(f"[DEBUG] Received response #{response_count}. Results count: {results_len}")
+                if results_len == 0:
+                    print(f"[DEBUG] Response had no results: {response}")
                 for result in response.results:
                     if result.is_final:
                         try:
@@ -162,10 +176,11 @@ def speech_ws(ws):
                                     "text": transcript,
                                     "speaker": speaker
                                 })
-                                print(f"Sending message: {message}")  # Debug log for sent message
+                                print(f"[DEBUG] Sending message: {message}")  # Debug log for sent message
                                 ws.send(message)
                             except Exception as e:
-                                print(f"WebSocket send error: {e}")  # Debug log for WebSocket error
+                                print(f"[ERROR] WebSocket send error: {e}")  # Debug log for WebSocket error
+                                print(traceback.format_exc())
                                 streamer_state["streamer"].finish()
                                 return
                             try:
@@ -189,16 +204,26 @@ def speech_ws(ws):
         while True:
             msg = ws.receive()
             if msg is None:
+                print("[DEBUG] WebSocket receive returned None — client disconnected")
                 break
             try:
                 data = json.loads(msg)
             except Exception:
+                try:
+                    print(f"[DEBUG] Received non-JSON message: {repr(msg)[:200]}")
+                except Exception:
+                    pass
                 continue
 
             event = data.get("event")
             if event == "audio_chunk":
                 # Decode base64 audio and feed to streamer
                 b64 = data.get("data")
+                try:
+                    b64_len = len(b64) if b64 is not None else 0
+                except Exception:
+                    b64_len = "unknown"
+                print(f"[DEBUG] event=audio_chunk conversation_id={conversation_id} b64_len={b64_len} streamer_active={streamer_state['active']}")
                 if not conversation_id:
                     cid = data.get("conversation_id")
                     if cid:
@@ -226,6 +251,7 @@ def speech_ws(ws):
                     cid = data.get("conversation_id")
                     if cid:
                         conversation_id = cid
+                print(f"[DEBUG] event={event} — finishing streamer for conversation_id={conversation_id}")
                 streamer_state["streamer"].finish()
                 break
             elif event == "set_conversation":
@@ -233,11 +259,13 @@ def speech_ws(ws):
                 cid = data.get("conversation_id")
                 if cid:
                     conversation_id = cid
+                    print(f"[DEBUG] set_conversation updated conversation_id={conversation_id}")
             else:
                 # Ignore unknown events
-                pass
+                print(f"[DEBUG] Unknown websocket event received: {event}")
     except Exception:
-        pass
+        print("[ERROR] Exception in WebSocket main loop")
+        print(traceback.format_exc())
     finally:
         # Clean up streaming resources
         try:
@@ -248,6 +276,7 @@ def speech_ws(ws):
             t.join(timeout=2)
         except Exception:
             pass
+        print(f"[DEBUG] WebSocket handler cleanup complete for conversation_id={conversation_id}")
 
 
 # Run the Flask app
