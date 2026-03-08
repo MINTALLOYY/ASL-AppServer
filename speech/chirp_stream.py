@@ -3,6 +3,7 @@ import queue
 import threading
 import traceback
 import logging
+import time
 from typing import Generator, Optional
 
 from google.cloud import speech_v1 as speech
@@ -25,15 +26,19 @@ class ChirpStreamer:
         sample_rate_hz: int = 16000,
         diarization_speaker_count: int = 2,
         model: str = "chirp",
+        audio_queue_maxsize: int = 256,
     ) -> None:
         self.language_code = language_code
         self.sample_rate_hz = sample_rate_hz
         self.diarization_speaker_count = diarization_speaker_count
         self.model = model
+        self.audio_queue_maxsize = max(16, int(audio_queue_maxsize))
 
         self._client = speech.SpeechClient()
-        self._audio_q: queue.Queue[bytes] = queue.Queue()
+        self._audio_q: queue.Queue[bytes] = queue.Queue(maxsize=self.audio_queue_maxsize)
         self._finished = threading.Event()
+        self._dropped_chunks = 0
+        self._last_empty_log_ts = 0.0
 
     def add_audio_base64(self, b64: str) -> None:
         """
@@ -47,12 +52,29 @@ class ChirpStreamer:
                 logger.debug("add_audio_base64 called with empty data")
                 return
             decoded = base64.b64decode(b64)
-            self._audio_q.put(decoded, block=False)
+            try:
+                self._audio_q.put(decoded, block=False)
+            except queue.Full:
+                self._dropped_chunks += 1
+                if self._dropped_chunks <= 3 or self._dropped_chunks % 25 == 0:
+                    logger.warning(
+                        "Audio queue full (maxsize=%s). Dropping chunk #%s (size=%s bytes)",
+                        self.audio_queue_maxsize,
+                        self._dropped_chunks,
+                        len(decoded),
+                    )
+                return
             try:
                 qsize = self._audio_q.qsize()
             except Exception:
                 qsize = "unknown"
-            logger.debug("Enqueued audio chunk size=%s bytes, queue_size=%s", len(decoded), qsize)
+            if isinstance(qsize, int):
+                if qsize >= int(self.audio_queue_maxsize * 0.8):
+                    logger.warning("Audio queue high water mark: queue_size=%s/%s", qsize, self.audio_queue_maxsize)
+                elif qsize % 20 == 0:
+                    logger.debug("Enqueued audio chunk size=%s bytes, queue_size=%s", len(decoded), qsize)
+            else:
+                logger.debug("Enqueued audio chunk size=%s bytes, queue_size=%s", len(decoded), qsize)
         except Exception as e:
             logger.error("Failed to add audio base64: %s", e)
             logger.error(traceback.format_exc())
@@ -105,15 +127,19 @@ class ChirpStreamer:
                 if chunk:
                     audio_passed = True
                     chunk_count += 1
-                    logger.debug(
-                        "Sending audio chunk #%s of size: %s bytes. Queue size: %s",
-                        chunk_count,
-                        len(chunk),
-                        self._audio_q.qsize(),
-                    )
+                    if chunk_count <= 3 or chunk_count % 25 == 0:
+                        logger.debug(
+                            "Sending audio chunk #%s of size: %s bytes. Queue size: %s",
+                            chunk_count,
+                            len(chunk),
+                            self._audio_q.qsize(),
+                        )
                     yield speech.StreamingRecognizeRequest(audio_content=chunk)
             except queue.Empty:
-                logger.debug("Queue empty. _finished=%s, queue_empty=%s", self._finished.is_set(), self._audio_q.empty())
+                now = time.time()
+                if now - self._last_empty_log_ts >= 10:
+                    logger.debug("Queue empty. _finished=%s, queue_empty=%s", self._finished.is_set(), self._audio_q.empty())
+                    self._last_empty_log_ts = now
                 continue
 
         logger.debug("_request_generator finished. Total chunks sent: %s. Audio passed: %s", chunk_count, audio_passed)
@@ -154,14 +180,14 @@ def speaker_label_from_result(result: speech.StreamingRecognitionResult) -> Opti
         if alt.words:
             tag = alt.words[-1].speaker_tag
             if tag:
-                    try:
-                        base = ord('A') - 1
-                        label = f"Speaker {chr(base + int(tag))}"
-                        logger.debug("speaker_label_from_result: tag=%s -> %s", tag, label)
-                        return label
-                    except Exception:
-                        logger.debug("speaker_label_from_result: invalid tag=%s", tag)
-                        pass
+                try:
+                    base = ord('A') - 1
+                    label = f"Speaker {chr(base + int(tag))}"
+                    logger.debug("speaker_label_from_result: tag=%s -> %s", tag, label)
+                    return label
+                except Exception:
+                    logger.debug("speaker_label_from_result: invalid tag=%s", tag)
+                    pass
     except Exception:
         pass
     return None

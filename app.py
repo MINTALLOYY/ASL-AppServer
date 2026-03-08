@@ -35,6 +35,16 @@ if gunicorn_error_logger.handlers:
 
 logger = logging.getLogger(__name__)
 
+# Startup diagnostics for Render/Gunicorn
+logger.info(
+    "Startup config: PORT=%s WEB_CONCURRENCY=%s PYTHONUNBUFFERED=%s GUNICORN_CMD_ARGS=%s SERVER_SOFTWARE=%s",
+    os.environ.get("PORT"),
+    os.environ.get("WEB_CONCURRENCY"),
+    os.environ.get("PYTHONUNBUFFERED"),
+    os.environ.get("GUNICORN_CMD_ARGS"),
+    os.environ.get("SERVER_SOFTWARE"),
+)
+
 app = Flask(__name__)
 sock = Sock(app)
 
@@ -178,9 +188,8 @@ def speech_ws(ws):
                     results_len = len(response.results)
                 except Exception:
                     results_len = "unknown"
-                logger.debug("Received response #%s. Results count: %s", response_count, results_len)
-                if results_len == 0:
-                    logger.debug("Response had no results: %s", response)
+                if response_count <= 3 or response_count % 20 == 0 or results_len == 0:
+                    logger.debug("Received response #%s. Results count: %s", response_count, results_len)
                 for result in response.results:
                     if result.is_final:
                         try:
@@ -244,19 +253,23 @@ def speech_ws(ws):
                     b64_len = len(b64) if b64 is not None else 0
                 except Exception:
                     b64_len = "unknown"
-                logger.debug(
-                    "event=audio_chunk conversation_id=%s b64_len=%s streamer_active=%s",
-                    conversation_id,
-                    b64_len,
-                    streamer_state["active"],
-                )
+                audio_chunk_count = streamer_state.get("audio_chunk_count", 0) + 1
+                streamer_state["audio_chunk_count"] = audio_chunk_count
+                if audio_chunk_count <= 3 or audio_chunk_count % 25 == 0:
+                    logger.debug(
+                        "event=audio_chunk conversation_id=%s chunk_count=%s b64_len=%s streamer_active=%s",
+                        conversation_id,
+                        audio_chunk_count,
+                        b64_len,
+                        streamer_state["active"],
+                    )
                 if not conversation_id:
                     cid = data.get("conversation_id")
                     if cid:
                         conversation_id = cid
                 # If previous stream errored (timeout), restart a new stream and consumer
                 if not streamer_state["active"]:
-                    print("[DEBUG] Restarting speech stream due to previous timeout...")
+                    logger.warning("Restarting speech stream due to previous timeout...")
                     try:
                         # Finish any old streamer
                         try:
@@ -269,7 +282,7 @@ def speech_ws(ws):
                         t = threading.Thread(target=consume_responses, daemon=True)
                         t.start()
                     except Exception as e:
-                        print(f"[ERROR] Failed to restart speech stream: {e}")
+                        logger.exception("Failed to restart speech stream: %s", e)
                 streamer_state["streamer"].add_audio_base64(b64 or "")
             elif event in ("end", "finish", "close"):
                 # End the session
