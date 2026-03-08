@@ -2,9 +2,12 @@ import base64
 import queue
 import threading
 import traceback
+import logging
 from typing import Generator, Optional
 
 from google.cloud import speech_v1 as speech
+
+logger = logging.getLogger(__name__)
 
 
 class ChirpStreamer:
@@ -41,7 +44,7 @@ class ChirpStreamer:
         """
         try:
             if not b64:
-                print("[DEBUG] add_audio_base64 called with empty data")
+                logger.debug("add_audio_base64 called with empty data")
                 return
             decoded = base64.b64decode(b64)
             self._audio_q.put(decoded, block=False)
@@ -49,10 +52,10 @@ class ChirpStreamer:
                 qsize = self._audio_q.qsize()
             except Exception:
                 qsize = "unknown"
-            print(f"[DEBUG] Enqueued audio chunk size={len(decoded)} bytes, queue_size={qsize}")
+            logger.debug("Enqueued audio chunk size=%s bytes, queue_size=%s", len(decoded), qsize)
         except Exception as e:
-            print(f"[ERROR] Failed to add audio base64: {e}")
-            print(traceback.format_exc())
+            logger.error("Failed to add audio base64: %s", e)
+            logger.error(traceback.format_exc())
 
     def finish(self) -> None:
         """Signal that no more audio will be sent; close the stream gracefully."""
@@ -94,7 +97,7 @@ class ChirpStreamer:
         """
         audio_passed = False  # Track if any audio is passed
         chunk_count = 0
-        print("[DEBUG] _request_generator started.")
+        logger.debug("_request_generator started.")
         
         while not self._finished.is_set() or not self._audio_q.empty():
             try:
@@ -105,12 +108,12 @@ class ChirpStreamer:
                     print(f"[DEBUG] Sending audio chunk #{chunk_count} of size: {len(chunk)} bytes. Queue size: {self._audio_q.qsize()}")
                     yield speech.StreamingRecognizeRequest(audio_content=chunk)
             except queue.Empty:
-                print(f"[DEBUG] Queue empty. _finished={self._finished.is_set()}, queue_empty={self._audio_q.empty()}")
+                    logger.debug("Queue empty. _finished=%s, queue_empty=%s", self._finished.is_set(), self._audio_q.empty())
                 continue
 
-        print(f"[DEBUG] _request_generator finished. Total chunks sent: {chunk_count}. Audio passed: {audio_passed}")
+        logger.debug("_request_generator finished. Total chunks sent: %s. Audio passed: %s", chunk_count, audio_passed)
         if not audio_passed:
-            print("[DEBUG] Connection made but no audio was passed through.")
+            logger.debug("Connection made but no audio was passed through.")
 
     def responses(self):
         """
@@ -120,14 +123,14 @@ class ChirpStreamer:
             Iterable of speech.StreamingRecognizeResponse.
         """
         try:
-            print("[DEBUG] Starting streaming recognize call (v1 API)...")
+            logger.debug("Starting streaming recognize call (v1 API)...")
             streaming_config = self._get_streaming_config()
             response_iterator = self._client.streaming_recognize(streaming_config, self._request_generator())
-            print("[DEBUG] Streaming recognize call started successfully.")
+            logger.debug("Streaming recognize call started successfully.")
             return response_iterator
         except Exception as e:
-            print(f"[ERROR] Error in streaming_recognize: {e}")
-            print(traceback.format_exc())
+            logger.error("Error in streaming_recognize: %s", e)
+            logger.error(traceback.format_exc())
             raise
 
 
@@ -146,14 +149,14 @@ def speaker_label_from_result(result: speech.StreamingRecognitionResult) -> Opti
         if alt.words:
             tag = alt.words[-1].speaker_tag
             if tag:
-                try:
-                    base = ord('A') - 1
-                    label = f"Speaker {chr(base + int(tag))}"
-                    print(f"[DEBUG] speaker_label_from_result: tag={tag} -> {label}")
-                    return label
-                except Exception:
-                    print(f"[DEBUG] speaker_label_from_result: invalid tag={tag}")
-                    pass
+                    try:
+                        base = ord('A') - 1
+                        label = f"Speaker {chr(base + int(tag))}"
+                        logger.debug("speaker_label_from_result: tag=%s -> %s", tag, label)
+                        return label
+                    except Exception:
+                        logger.debug("speaker_label_from_result: invalid tag=%s", tag)
+                        pass
     except Exception:
         pass
     return None
