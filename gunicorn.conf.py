@@ -1,15 +1,19 @@
 """Gunicorn configuration for Render deployment.
 
-Uses eventlet async worker for WebSocket support.
+Uses threaded workers for Flask-Sock WebSocket support.
+Avoids eventlet/gevent monkey-patching issues with --preload.
 """
 
 import os
 
-# Use eventlet async worker — better WebSocket compatibility with flask-sock
-worker_class = "eventlet"
+# Use threaded worker for websocket connections
+worker_class = "gthread"
+
+# Threads per worker
+threads = int(os.environ.get("WEB_THREADS", 8))
 
 # Single worker to stay within Render free-tier memory limits
-workers = 1
+workers = int(os.environ.get("WEB_CONCURRENCY", 1))
 
 # Disable worker timeout so WebSocket connections aren't killed
 timeout = 0
