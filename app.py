@@ -1,11 +1,8 @@
-# Eventlet monkey-patch MUST come first before any other imports
-import eventlet
-eventlet.monkey_patch()
-
 import json
 import os
 import tempfile
 import threading
+import time
 from typing import Optional
 import traceback
 
@@ -230,7 +227,7 @@ def speech_ws(ws):
     def consume_responses():
         try:
             response_count = 0
-            logger.debug("consume_responses started. Waiting for responses...")
+            logger.info("consume_responses started. Waiting for Google Speech responses...")
             for response in streamer_state["streamer"].responses():
                 response_count += 1
                 try:
@@ -238,7 +235,7 @@ def speech_ws(ws):
                 except Exception:
                     results_len = "unknown"
                 if response_count <= 3 or response_count % 20 == 0 or results_len == 0:
-                    logger.debug("Received response #%s. Results count: %s", response_count, results_len)
+                    logger.info("Received response #%s. Results count: %s", response_count, results_len)
                 for result in response.results:
                     if result.is_final:
                         try:
@@ -282,14 +279,27 @@ def speech_ws(ws):
     # Main loop: receive audio chunks from Flutter client
     logger.info("Entering WebSocket main loop. Waiting for messages from client...")
     msg_count = 0
+    last_idle_log_at = 0.0
+    receive_timeout_sec = 15
     try:
         while True:
             msg_count += 1
             if msg_count <= 3:
-                logger.debug("ws.receive() call #%s - waiting for client message...", msg_count)
-            msg = ws.receive()
+                logger.info("ws.receive() call #%s - waiting for client message...", msg_count)
+            try:
+                msg = ws.receive(timeout=receive_timeout_sec)
+            except TimeoutError:
+                now = time.time()
+                if now - last_idle_log_at >= 30:
+                    logger.info(
+                        "WebSocket idle for %ss waiting for client message (conversation_id=%s)",
+                        receive_timeout_sec,
+                        conversation_id,
+                    )
+                    last_idle_log_at = now
+                continue
             if msg_count <= 5:
-                logger.debug("ws.receive() returned. msg_count=%s msg_type=%s msg_len=%s", 
+                logger.info("ws.receive() returned. msg_count=%s msg_type=%s msg_len=%s", 
                             msg_count, type(msg).__name__, len(msg) if msg else 0)
             if msg is None:
                 logger.info("WebSocket receive returned None — client disconnected")
@@ -314,7 +324,7 @@ def speech_ws(ws):
                 audio_chunk_count = streamer_state.get("audio_chunk_count", 0) + 1
                 streamer_state["audio_chunk_count"] = audio_chunk_count
                 if audio_chunk_count <= 3 or audio_chunk_count % 25 == 0:
-                    logger.debug(
+                    logger.info(
                         "event=audio_chunk conversation_id=%s chunk_count=%s b64_len=%s streamer_active=%s",
                         conversation_id,
                         audio_chunk_count,
