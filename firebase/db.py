@@ -19,7 +19,7 @@ class FirestoreDB:
     """
     def __init__(self, project_id: Optional[str] = None):
         self.client = firestore.Client(project=project_id)
-
+#
     def save_message(self, conversation_id: str, text: str, source: str, speaker: Optional[str] = None):
         """
         Save a transcript message to Firestore under a conversation.
