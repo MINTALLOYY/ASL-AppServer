@@ -53,6 +53,10 @@ sock = Sock(app)
 # db = FirestoreDB(project_id=FIREBASE_PROJECT_ID)
 db = False
 
+# In-memory speaker registration store (MVP – not persisted across restarts).
+# Keys: conversation_id, Values: dict mapping diarization label to participant name.
+speaker_registry: dict[str, dict[str, str]] = {}
+
 creds = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS")
 if creds and creds.strip().startswith("{"):
     try:
@@ -145,6 +149,69 @@ def speech_finalize():
         return jsonify({"status": "finalized", "conversation_id": conversation_id})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
+
+@app.post("/speech/register_speakers")
+def register_speakers_post():
+    """
+    Register speaker name mappings for a conversation.
+
+    Expected JSON payload:
+        {
+            "conversation_id": "abc123",
+            "speakers": [
+                {"label": "Speaker_0", "name": "Marcus"},
+                {"label": "Speaker_1", "name": "Priya"}
+            ]
+        }
+
+    Returns:
+        JSON: {"status": "ok", "registered": <count>}
+        Error 400 if conversation_id is missing or speakers is not a list.
+    """
+    data = request.get_json(silent=True) or {}
+    conversation_id = data.get("conversation_id")
+    if not conversation_id or not isinstance(conversation_id, str):
+        return jsonify({"error": "conversation_id is required"}), 400
+
+    speakers = data.get("speakers", [])
+    if not isinstance(speakers, list):
+        return jsonify({"error": "speakers must be a list"}), 400
+
+    mapping: dict[str, str] = {}
+    for entry in speakers:
+        if isinstance(entry, dict):
+            label = entry.get("label")
+            name = entry.get("name")
+            if isinstance(label, str) and isinstance(name, str) and label and name:
+                mapping[label] = name
+
+    speaker_registry[conversation_id] = mapping
+    logger.info(
+        "Registered %d speaker(s) for conversation_id=%s: %s",
+        len(mapping), conversation_id, mapping,
+    )
+    return jsonify({"status": "ok", "registered": len(mapping)})
+
+
+@app.get("/speech/register_speakers")
+def register_speakers_get():
+    """
+    Debug endpoint: return the current speaker mapping for a conversation.
+
+    Query parameters:
+        - conversation_id (required): the conversation to look up.
+
+    Returns:
+        JSON: {"conversation_id": "...", "speakers": {...}}
+        Error 400 if conversation_id is missing.
+    """
+    conversation_id = request.args.get("conversation_id")
+    if not conversation_id:
+        return jsonify({"error": "conversation_id query parameter is required"}), 400
+
+    mapping = speaker_registry.get(conversation_id, {})
+    return jsonify({"conversation_id": conversation_id, "speakers": mapping})
 
 
 @app.post("/asl/transcribe")
