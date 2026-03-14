@@ -1,0 +1,83 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>ASL Socket.IO Test</title>
+  <script src="https://cdn.socket.io/4.7.2/socket.io.min.js"></script>
+</head>
+<body>
+  <h2>ASL Real-Time Detection - Socket.IO Browser Test</h2>
+  <video id="video" autoplay width="400"></video>
+  <p>Status: <span id="status" style="font-weight:bold">Disconnected</span></p>
+  <div id="output" style="font-size:24px; margin-top:12px; min-height:40px; border:1px solid #ccc; padding:8px"></div>
+  <button onclick="startConnection()">Connect</button>
+  <button onclick="stopConnection()">Disconnect</button>
+
+  <script>
+    let socket = null;
+    let interval = null;
+    const video  = document.getElementById("video");
+    const output = document.getElementById("output");
+    const status = document.getElementById("status");
+    const canvas = document.createElement("canvas");
+    const ctx    = canvas.getContext("2d");
+
+    const SERVER = "http://localhost:5000";
+
+    navigator.mediaDevices.getUserMedia({ video: true }).then(stream => {
+      video.srcObject = stream;
+    });
+
+    function startConnection() {
+      if (socket) return;
+      socket = io(SERVER, { transports: ["websocket", "polling"] });
+
+      socket.on("connect", () => {
+        status.textContent = "Connected";
+        interval = setInterval(sendFrame, 67);
+      });
+
+      socket.on("asl_result", ({ word }) => {
+        output.textContent += word + " ";
+      });
+
+      socket.on("asl_error", ({ message }) => {
+        status.textContent = "Error: " + message;
+      });
+
+      socket.on("disconnect", () => {
+        status.textContent = "Disconnected";
+        clearInterval(interval);
+        socket = null;
+      });
+
+      socket.on("connect_error", () => {
+        status.textContent = "Connection error";
+      });
+    }
+
+    function stopConnection() {
+      if (!socket) return;
+      clearInterval(interval);
+      socket.disconnect();
+      socket = null;
+      status.textContent = "Disconnected";
+    }
+
+    function sendFrame() {
+      if (!socket || !socket.connected) return;
+      if (!video.videoWidth || !video.videoHeight) return;
+
+      canvas.width  = video.videoWidth;
+      canvas.height = video.videoHeight;
+      ctx.drawImage(video, 0, 0);
+
+      canvas.toBlob(blob => {
+        if (!blob) return;
+        blob.arrayBuffer().then(buf => {
+          socket.emit("asl_frame", { frame: buf });
+        });
+      }, "image/jpeg", 0.6);
+    }
+  </script>
+</body>
+</html>

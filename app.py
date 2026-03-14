@@ -9,12 +9,14 @@ import traceback
 from dotenv import load_dotenv
 from flask import Flask, jsonify, request
 from flask_sock import Sock
+from flask_socketio import SocketIO, emit
 import logging
 import sys
 
 from firebase.db import FirestoreDB
 from speech.chirp_stream import ChirpStreamer, speaker_label_from_result
 from asl.asl_inference import transcribe_video
+from asl.predictor import ASLPredictor
 
 load_dotenv()
 
@@ -48,10 +50,67 @@ logger.info(
 
 app = Flask(__name__)
 sock = Sock(app)
+socketio_async_mode = os.environ.get("SOCKETIO_ASYNC_MODE", "threading")
+socketio = SocketIO(app, cors_allowed_origins="*", async_mode=socketio_async_mode)
+logger.info("Socket.IO initialized with async_mode=%s", socketio.async_mode)
 
 # FIREBASE_PROJECT_ID = os.environ.get("FIREBASE_PROJECT_ID")
 # db = FirestoreDB(project_id=FIREBASE_PROJECT_ID)
 db = False
+
+# --- ASL real-time predictor ---
+_asl_model_path = os.path.join(os.path.dirname(__file__), "asl", "model.h5")
+asl_predictor = None
+try:
+    if os.path.exists(_asl_model_path):
+        asl_predictor = ASLPredictor(model_path=_asl_model_path)
+        logger.info("ASL predictor loaded from %s", _asl_model_path)
+    else:
+        logger.warning("ASL model not found at %s — /asl/ws will return errors until model is placed", _asl_model_path)
+except Exception:
+    logger.exception("Failed to load ASL predictor")
+
+
+@socketio.on("asl_frame")
+def handle_asl_frame(data):
+    """
+    Receives one JPEG frame from the client and emits a prediction when available.
+    Accepts frame payload as raw bytes, bytearray, list[int], or base64 string.
+    """
+    import base64
+
+    if asl_predictor is None:
+        emit("asl_error", {"message": "ASL model not loaded on server"})
+        return
+
+    if not isinstance(data, dict):
+        return
+
+    frame_payload = data.get("frame")
+    if frame_payload is None:
+        return
+
+    frame_bytes = None
+    if isinstance(frame_payload, (bytes, bytearray)):
+        frame_bytes = bytes(frame_payload)
+    elif isinstance(frame_payload, list):
+        try:
+            frame_bytes = bytes(frame_payload)
+        except Exception:
+            return
+    elif isinstance(frame_payload, str):
+        # Support base64 payloads for clients that cannot emit binary attachments.
+        try:
+            frame_bytes = base64.b64decode(frame_payload)
+        except Exception:
+            return
+
+    if not frame_bytes:
+        return
+
+    word = asl_predictor.process_frame(frame_bytes)
+    if word:
+        emit("asl_result", {"word": word})
 
 creds = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS")
 if creds and creds.strip().startswith("{"):
@@ -385,7 +444,65 @@ def speech_ws(ws):
         logger.debug("WebSocket handler cleanup complete for conversation_id=%s", conversation_id)
 
 
+@sock.route("/asl/ws")
+def asl_ws(ws):
+    """
+    WebSocket endpoint for real-time ASL sign language recognition.
+
+    Client sends JSON messages:
+        {"event": "frame", "data": "<base64 JPEG>"}
+        {"event": "end"}
+
+    Server responds with JSON:
+        {"event": "asl_result", "word": "hello"}
+    """
+    import base64
+
+    logger.info("ASL WebSocket connection opened")
+
+    if asl_predictor is None:
+        ws.send(json.dumps({"event": "error", "message": "ASL model not loaded on server"}))
+        logger.error("ASL WebSocket rejected — no model loaded")
+        return
+
+    try:
+        while True:
+            msg = ws.receive(timeout=30)
+            if msg is None:
+                logger.info("ASL WebSocket client disconnected")
+                break
+
+            try:
+                data = json.loads(msg)
+            except Exception:
+                continue
+
+            event = data.get("event")
+
+            if event == "frame":
+                b64 = data.get("data")
+                if not b64:
+                    continue
+                try:
+                    frame_bytes = base64.b64decode(b64)
+                except Exception:
+                    continue
+
+                word = asl_predictor.process_frame(frame_bytes)
+                if word:
+                    ws.send(json.dumps({"event": "asl_result", "word": word}))
+
+            elif event in ("end", "close", "finish"):
+                logger.info("ASL WebSocket session ended by client")
+                break
+
+    except Exception:
+        logger.exception("Error in ASL WebSocket handler")
+    finally:
+        logger.info("ASL WebSocket connection closed")
+
+
 # Run the Flask app
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port)
+    socketio.run(app, host="0.0.0.0", port=port, debug=True)
