@@ -1,3 +1,4 @@
+import base64
 import json
 import os
 import tempfile
@@ -14,6 +15,7 @@ import sys
 
 from firebase.db import FirestoreDB
 from speech.chirp_stream import ChirpStreamer, speaker_label_from_result
+from speech.voice_profile import VoiceProfileStore, AudioBuffer
 from asl.asl_inference import transcribe_video
 
 load_dotenv()
@@ -56,6 +58,17 @@ db = False
 # In-memory speaker registration store (MVP – not persisted across restarts).
 # Keys: conversation_id, Values: dict mapping diarization label to participant name.
 speaker_registry: dict[str, dict[str, str]] = {}
+
+# Session mode state machine for speaker identification flow.
+# Keys: conversation_id, Values: 'identifying' | 'captioning'
+session_modes: dict[str, str] = {}
+
+# Speaker labels already reported during identification phase.
+# Keys: conversation_id, Values: set of labels (e.g. {'Speaker_1', 'Speaker_2'})
+identified_labels: dict[str, set] = {}
+
+# Voice-print profile store for speaker identification.
+voice_store = VoiceProfileStore()
 
 creds = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS")
 if creds and creds.strip().startswith("{"):
@@ -132,10 +145,10 @@ def speech_finalize():
     Finalize a speech session by marking the conversation as completed in Firestore.
     
     Expected JSON payload:
-        {"conversation_id": "abc123"}
+        {"conversation_id": "abc123", "captions": [...]}
     
     Returns:
-        JSON: {"status": "finalized", "conversation_id": "abc123"}
+        JSON: {"status": "finalized", "conversation_id": "abc123", "speaker_map": {...}}
         Error 400 if conversation_id is missing.
         Error 500 if Firestore operation fails.
     """
@@ -144,11 +157,21 @@ def speech_finalize():
     if not conversation_id:
         return jsonify({"error": "conversation_id is required"}), 400
     try:
+        speaker_map = speaker_registry.get(conversation_id, {})
         if db:
             db.finalize_conversation(conversation_id)
-        return jsonify({"status": "finalized", "conversation_id": conversation_id})
+        return jsonify({
+            "status": "finalized",
+            "conversation_id": conversation_id,
+            "speaker_map": speaker_map,
+        })
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+    finally:
+        # Clean up all session state
+        speaker_registry.pop(conversation_id, None)
+        session_modes.pop(conversation_id, None)
+        identified_labels.pop(conversation_id, None)
 
 
 @app.post("/speech/register_speakers")
@@ -214,6 +237,44 @@ def register_speakers_get():
     return jsonify({"conversation_id": conversation_id, "speakers": mapping})
 
 
+@app.post("/speech/create_voice_profile")
+def create_voice_profile():
+    """
+    Create a voice-print profile from a registration audio sample.
+
+    Expected JSON payload:
+        {
+            "conversation_id": "conv_123",
+            "name": "Marcus",
+            "audio": "<base64-encoded 16kHz 16-bit mono PCM>"
+        }
+
+    Returns:
+        JSON: {"status": "ok", "name": "Marcus"}
+        Error 400 if parameters are missing or audio is too short.
+    """
+    data = request.get_json(silent=True) or {}
+    conversation_id = data.get("conversation_id")
+    name = data.get("name")
+    audio_b64 = data.get("audio")
+
+    if not conversation_id or not name or not audio_b64:
+        return jsonify({"error": "conversation_id, name, and audio are required"}), 400
+
+    try:
+        pcm_bytes = base64.b64decode(audio_b64)
+    except Exception:
+        return jsonify({"error": "Invalid base64 audio data"}), 400
+
+    success = voice_store.add_profile(conversation_id, name, pcm_bytes)
+    if success:
+        return jsonify({"status": "ok", "name": name})
+    else:
+        return jsonify({
+            "error": "Failed to create voice profile — audio may be too short or resemblyzer not installed"
+        }), 400
+
+
 @app.post("/asl/transcribe")
 def asl_transcribe():
     """
@@ -263,32 +324,50 @@ def asl_transcribe():
 @sock.route("/speech/ws")
 def speech_ws(ws):
     """
-    WebSocket endpoint for live speech-to-text streaming.
+    WebSocket endpoint for live speech-to-text streaming with speaker identification.
     
     Query parameters:
         - conversation_id (optional): Firestore conversation ID to save transcripts
+        - mode (optional): 'identifying' or 'captioning' (default: 'captioning')
     
     Expected messages from client (JSON):
         - {"event": "audio_chunk", "data": "<base64 audio>", "conversation_id": "abc123"}
         - {"event": "set_conversation", "conversation_id": "abc123"}
+        - {"event": "begin_captioning"}  — switches mode from identifying to captioning
         - {"event": "end"} or {"event": "finish"} or {"event": "close"}
     
     Server responses (JSON):
-        - {"event": "final_transcript", "text": "...", "speaker": "Speaker A"}
+        - {"event": "speaker_detected", "label": "Speaker_1"}  (identifying mode only)
+        - {"event": "captioning_started"}  (after begin_captioning)
+        - {"event": "final_transcript", "text": "...", "speaker": "Speaker A"}  (captioning mode)
     
     Audio format: base64-encoded 16 kHz, 16-bit mono PCM (LINEAR16).
     """
     # Get conversation_id from query params (optional)
     conversation_id: Optional[str] = request.args.get("conversation_id")
+    # Mode state machine: 'identifying' or 'captioning'
+    initial_mode = request.args.get("mode", "captioning")
+    if conversation_id:
+        session_modes[conversation_id] = initial_mode
+        identified_labels[conversation_id] = set()
     # Initialize Google Speech streaming client (with restart capability)
     streamer_state = {"streamer": ChirpStreamer(), "active": True}
+
+    # Voice-print matching state
+    use_voice_matching = voice_store.has_profiles(conversation_id) if conversation_id else False
+    audio_buffer = AudioBuffer() if use_voice_matching else None
+    tag_to_name: dict[int, str] = {}
+    tag_identify_attempts: dict[int, int] = {}
 
     # Log when a new WebSocket connection opens
     try:
         remote = request.remote_addr
     except Exception:
         remote = None
-    logger.info("WebSocket connection opened. conversation_id=%s, remote=%s", conversation_id, remote)
+    logger.info(
+        "WebSocket connection opened. conversation_id=%s, remote=%s, voice_matching=%s, mode=%s",
+        conversation_id, remote, use_voice_matching, initial_mode,
+    )
 
     # Background thread: consume responses from Google Speech and send to client
     def consume_responses():
@@ -305,12 +384,58 @@ def speech_ws(ws):
                     logger.info("Received response #%s. Results count: %s", response_count, results_len)
                 for result in response.results:
                     if result.is_final:
+                        # ── Identifying mode: emit speaker_detected, skip transcript ──
+                        current_mode = session_modes.get(conversation_id, "captioning") if conversation_id else "captioning"
+                        if current_mode == "identifying":
+                            try:
+                                alt = result.alternatives[0]
+                                if alt.words:
+                                    for word in alt.words:
+                                        tag = word.speaker_tag
+                                        if tag:
+                                            label = f"Speaker_{tag}"
+                                            seen = identified_labels.get(conversation_id, set())
+                                            if label not in seen:
+                                                seen.add(label)
+                                                identified_labels[conversation_id] = seen
+                                                ws.send(json.dumps({
+                                                    "event": "speaker_detected",
+                                                    "label": label,
+                                                }))
+                                                logger.info("speaker_detected: label=%s conversation_id=%s", label, conversation_id)
+                                                break  # one event per audio burst
+                            except Exception as e:
+                                logger.error("Error in identifying mode: %s", e)
+                            continue  # do NOT emit final_transcript during identification
+                        # ── Captioning mode (existing logic) ──
                         try:
                             alt = result.alternatives[0]
                             transcript = (alt.transcript or "").strip()
                         except Exception:
                             transcript = ""
                         speaker = speaker_label_from_result(result)
+                        # Voice-print matching: resolve speaker_tag to a registered name
+                        if use_voice_matching and alt.words:
+                            try:
+                                tag = alt.words[-1].speaker_tag
+                                if tag:
+                                    if tag in tag_to_name:
+                                        speaker = tag_to_name[tag]
+                                    elif tag_identify_attempts.get(tag, 0) < 5:
+                                        tag_identify_attempts[tag] = tag_identify_attempts.get(tag, 0) + 1
+                                        words_for_tag = [w for w in alt.words if w.speaker_tag == tag]
+                                        if words_for_tag:
+                                            t0 = words_for_tag[0].start_time.seconds + words_for_tag[0].start_time.nanos * 1e-9
+                                            t1 = words_for_tag[-1].end_time.seconds + words_for_tag[-1].end_time.nanos * 1e-9
+                                            if t1 - t0 >= 0.8 and audio_buffer is not None:
+                                                segment = audio_buffer.extract(t0, t1)
+                                                matched = voice_store.identify(conversation_id, segment)
+                                                if matched:
+                                                    tag_to_name[tag] = matched
+                                                    speaker = matched
+                                                    logger.info("Voice-matched tag=%s -> '%s'", tag, matched)
+                            except Exception as e:
+                                logger.debug("Voice matching attempt failed: %s", e)
                         if transcript:
                             try:
                                 message = json.dumps({
@@ -419,6 +544,12 @@ def speech_ws(ws):
                     except Exception as e:
                         logger.exception("Failed to restart speech stream: %s", e)
                 streamer_state["streamer"].add_audio_base64(b64 or "")
+                # Buffer raw audio for voice-print matching
+                if audio_buffer is not None and b64:
+                    try:
+                        audio_buffer.append(base64.b64decode(b64))
+                    except Exception:
+                        pass
             elif event in ("end", "finish", "close"):
                 # End the session
                 if not conversation_id:
@@ -428,6 +559,12 @@ def speech_ws(ws):
                 logger.info("event=%s — finishing streamer for conversation_id=%s", event, conversation_id)
                 streamer_state["streamer"].finish()
                 break
+            elif event == "begin_captioning":
+                # Mode switch: identifying -> captioning
+                if conversation_id:
+                    session_modes[conversation_id] = "captioning"
+                    logger.info("Mode switched to captioning for conversation_id=%s", conversation_id)
+                ws.send(json.dumps({"event": "captioning_started"}))
             elif event == "set_conversation":
                 # Set or update conversation_id mid-session
                 cid = data.get("conversation_id")
@@ -449,6 +586,11 @@ def speech_ws(ws):
             t.join(timeout=2)
         except Exception:
             pass
+        # Clean up voice profiles for this session
+        if conversation_id:
+            voice_store.cleanup(conversation_id)
+            session_modes.pop(conversation_id, None)
+            identified_labels.pop(conversation_id, None)
         logger.debug("WebSocket handler cleanup complete for conversation_id=%s", conversation_id)
 
 
