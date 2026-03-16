@@ -326,8 +326,8 @@ def speech_ws(ws):
     except Exception:
         remote = None
     logger.info(
-        "WebSocket connection opened. conversation_id=%s, remote=%s, voice_matching=%s, mode=%s",
-        conversation_id, remote, use_voice_matching, initial_mode,
+        "WebSocket connection opened. conversation_id=%s, remote=%s, mode=%s",
+        conversation_id, remote, initial_mode,
     )
 
     # Background thread: consume responses from Google Speech and send to client
