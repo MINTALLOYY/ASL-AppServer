@@ -15,7 +15,7 @@ import sys
 
 from firebase.db import FirestoreDB
 from speech.chirp_stream import ChirpStreamer, speaker_label_from_result
-from speech.voice_profile import VoiceProfileStore, AudioBuffer
+
 from asl.asl_inference import transcribe_video
 
 load_dotenv()
@@ -67,9 +67,6 @@ session_modes: dict[str, str] = {}
 # Keys: conversation_id, Values: set of labels (e.g. {'Speaker_1', 'Speaker_2'})
 identified_labels: dict[str, set] = {}
 
-# Voice-print profile store for speaker identification.
-voice_store = VoiceProfileStore()
-
 creds = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS")
 if creds and creds.strip().startswith("{"):
     try:
@@ -89,6 +86,13 @@ def health():
     Returns:
         JSON: {"status": "ok"} if the server is running.
     """
+    try:
+        remote = request.remote_addr
+    except Exception:
+        remote = None
+    logger.info("Health check requested. remote=%s, creds_present=%s", remote, bool(creds))
+    # Ensure at least one unbuffered output for quick terminal verification
+    print(f"Health check requested. remote={remote}, creds_present={bool(creds)}", flush=True)
     if creds:
         return jsonify({"status": "ok and creds"})
     return jsonify({"status": "server running but no credentials"}), 500
@@ -237,43 +241,6 @@ def register_speakers_get():
     return jsonify({"conversation_id": conversation_id, "speakers": mapping})
 
 
-@app.post("/speech/create_voice_profile")
-def create_voice_profile():
-    """
-    Create a voice-print profile from a registration audio sample.
-
-    Expected JSON payload:
-        {
-            "conversation_id": "conv_123",
-            "name": "Marcus",
-            "audio": "<base64-encoded 16kHz 16-bit mono PCM>"
-        }
-
-    Returns:
-        JSON: {"status": "ok", "name": "Marcus"}
-        Error 400 if parameters are missing or audio is too short.
-    """
-    data = request.get_json(silent=True) or {}
-    conversation_id = data.get("conversation_id")
-    name = data.get("name")
-    audio_b64 = data.get("audio")
-
-    if not conversation_id or not name or not audio_b64:
-        return jsonify({"error": "conversation_id, name, and audio are required"}), 400
-
-    try:
-        pcm_bytes = base64.b64decode(audio_b64)
-    except Exception:
-        return jsonify({"error": "Invalid base64 audio data"}), 400
-
-    success = voice_store.add_profile(conversation_id, name, pcm_bytes)
-    if success:
-        return jsonify({"status": "ok", "name": name})
-    else:
-        return jsonify({
-            "error": "Failed to create voice profile — audio may be too short or resemblyzer not installed"
-        }), 400
-
 
 @app.post("/asl/transcribe")
 def asl_transcribe():
@@ -353,12 +320,6 @@ def speech_ws(ws):
     # Initialize Google Speech streaming client (with restart capability)
     streamer_state = {"streamer": ChirpStreamer(), "active": True}
 
-    # Voice-print matching state
-    use_voice_matching = voice_store.has_profiles(conversation_id) if conversation_id else False
-    audio_buffer = AudioBuffer() if use_voice_matching else None
-    tag_to_name: dict[int, str] = {}
-    tag_identify_attempts: dict[int, int] = {}
-
     # Log when a new WebSocket connection opens
     try:
         remote = request.remote_addr
@@ -414,28 +375,6 @@ def speech_ws(ws):
                         except Exception:
                             transcript = ""
                         speaker = speaker_label_from_result(result)
-                        # Voice-print matching: resolve speaker_tag to a registered name
-                        if use_voice_matching and alt.words:
-                            try:
-                                tag = alt.words[-1].speaker_tag
-                                if tag:
-                                    if tag in tag_to_name:
-                                        speaker = tag_to_name[tag]
-                                    elif tag_identify_attempts.get(tag, 0) < 5:
-                                        tag_identify_attempts[tag] = tag_identify_attempts.get(tag, 0) + 1
-                                        words_for_tag = [w for w in alt.words if w.speaker_tag == tag]
-                                        if words_for_tag:
-                                            t0 = words_for_tag[0].start_time.seconds + words_for_tag[0].start_time.nanos * 1e-9
-                                            t1 = words_for_tag[-1].end_time.seconds + words_for_tag[-1].end_time.nanos * 1e-9
-                                            if t1 - t0 >= 0.8 and audio_buffer is not None:
-                                                segment = audio_buffer.extract(t0, t1)
-                                                matched = voice_store.identify(conversation_id, segment)
-                                                if matched:
-                                                    tag_to_name[tag] = matched
-                                                    speaker = matched
-                                                    logger.info("Voice-matched tag=%s -> '%s'", tag, matched)
-                            except Exception as e:
-                                logger.debug("Voice matching attempt failed: %s", e)
                         if transcript:
                             try:
                                 message = json.dumps({
@@ -544,12 +483,6 @@ def speech_ws(ws):
                     except Exception as e:
                         logger.exception("Failed to restart speech stream: %s", e)
                 streamer_state["streamer"].add_audio_base64(b64 or "")
-                # Buffer raw audio for voice-print matching
-                if audio_buffer is not None and b64:
-                    try:
-                        audio_buffer.append(base64.b64decode(b64))
-                    except Exception:
-                        pass
             elif event in ("end", "finish", "close"):
                 # End the session
                 if not conversation_id:
@@ -586,9 +519,8 @@ def speech_ws(ws):
             t.join(timeout=2)
         except Exception:
             pass
-        # Clean up voice profiles for this session
+        # Clean up session state
         if conversation_id:
-            voice_store.cleanup(conversation_id)
             session_modes.pop(conversation_id, None)
             identified_labels.pop(conversation_id, None)
         logger.debug("WebSocket handler cleanup complete for conversation_id=%s", conversation_id)
