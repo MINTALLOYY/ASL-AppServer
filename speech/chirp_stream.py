@@ -6,35 +6,40 @@ import logging
 import time
 from typing import Generator, Optional
 
-from google.cloud import speech_v1 as speech
+from google.cloud.speech_v2 import SpeechClient
+from google.cloud.speech_v2.types import cloud_speech
 
 logger = logging.getLogger(__name__)
 
 
 class ChirpStreamer:
     """
-    Streaming speech-to-text client using Google Cloud Speech v2 (Chirp).
-    
+    Streaming speech-to-text client using Google Cloud Speech v2.
+
     Supports:
         - Real-time audio streaming via gRPC
-        - Speaker diarization (labels speakers A, B, etc.)
+        - Speaker diarization (labels speakers 1, 2, etc.)
         - Base64 audio input (16 kHz, 16-bit mono PCM)
     """
     def __init__(
         self,
+        project_id: str = "",
         language_code: str = "en-US",
         sample_rate_hz: int = 16000,
         diarization_speaker_count: int = 2,
-        model: str = "chirp",
+        model: str = "long",
+        location: str = "global",
         audio_queue_maxsize: int = 256,
     ) -> None:
+        self.project_id = project_id
         self.language_code = language_code
         self.sample_rate_hz = sample_rate_hz
         self.diarization_speaker_count = diarization_speaker_count
         self.model = model
+        self.location = location
         self.audio_queue_maxsize = max(16, int(audio_queue_maxsize))
 
-        self._client = speech.SpeechClient()
+        self._client = SpeechClient()
         self._audio_q: queue.Queue[bytes] = queue.Queue(maxsize=self.audio_queue_maxsize)
         self._finished = threading.Event()
         self._dropped_chunks = 0
@@ -43,7 +48,7 @@ class ChirpStreamer:
     def add_audio_base64(self, b64: str) -> None:
         """
         Add a base64-encoded audio chunk to the streaming queue.
-        
+
         Args:
             b64: Base64-encoded audio data (16 kHz, 16-bit mono PCM).
         """
@@ -85,48 +90,55 @@ class ChirpStreamer:
 
     def _get_streaming_config(self):
         """
-        Create the streaming recognition config.
-        
-        Returns:
-            speech.StreamingRecognitionConfig: The config for streaming recognition.
+        Create the v2 streaming recognition config.
         """
-        diarization_config = speech.SpeakerDiarizationConfig(
-            enable_speaker_diarization=True,
-            min_speaker_count=max(2, self.diarization_speaker_count),
-            max_speaker_count=max(2, self.diarization_speaker_count),
+        recognition_config = cloud_speech.RecognitionConfig(
+            explicit_decoding_config=cloud_speech.ExplicitDecodingConfig(
+                encoding=cloud_speech.ExplicitDecodingConfig.AudioEncoding.LINEAR16,
+                sample_rate_hertz=self.sample_rate_hz,
+                audio_channel_count=1,
+            ),
+            features=cloud_speech.RecognitionFeatures(
+                enable_automatic_punctuation=True,
+                diarization_config=cloud_speech.SpeakerDiarizationConfig(
+                    min_speaker_count=max(2, self.diarization_speaker_count),
+                    max_speaker_count=max(2, self.diarization_speaker_count),
+                ),
+            ),
+            language_codes=[self.language_code],
+            model=self.model,
         )
-        rec_config = speech.RecognitionConfig(
-            encoding=speech.RecognitionConfig.AudioEncoding.LINEAR16,
-            sample_rate_hertz=self.sample_rate_hz,
-            language_code=self.language_code,
-            enable_automatic_punctuation=True,
-            diarization_config=diarization_config,
+        streaming_config = cloud_speech.StreamingRecognitionConfig(
+            config=recognition_config,
+            streaming_features=cloud_speech.StreamingRecognitionFeatures(
+                interim_results=False,
+            ),
         )
-        streaming_config = speech.StreamingRecognitionConfig(
-            config=rec_config,
-            interim_results=False,
-            single_utterance=False,
-        )
-        logger.debug("Streaming config created: %s", streaming_config)
+        logger.debug("v2 streaming config created: %s", streaming_config)
         return streaming_config
 
-    def _request_generator(self) -> Generator[speech.StreamingRecognizeRequest, None, None]:
+    def _request_generator(self) -> Generator[cloud_speech.StreamingRecognizeRequest, None, None]:
         """
-        Generate streaming requests for Google Speech gRPC API.
-        Sends silent keepalive frames when no real audio arrives to prevent
-        Google's Audio Timeout Error.
-        
-        Yields:
-            speech.StreamingRecognizeRequest: Audio chunks.
+        Generate streaming requests for Google Speech v2 gRPC API.
+        First request sends config, subsequent requests send audio.
+        Sends silent keepalive frames when idle to prevent Audio Timeout.
         """
-        audio_passed = False  # Track if any audio is passed
+        recognizer = f"projects/{self.project_id}/locations/{self.location}/recognizers/_"
+
+        # First request: config only (no audio)
+        yield cloud_speech.StreamingRecognizeRequest(
+            recognizer=recognizer,
+            streaming_config=self._get_streaming_config(),
+        )
+        logger.debug("Sent v2 config request. recognizer=%s", recognizer)
+
+        audio_passed = False
         chunk_count = 0
         last_audio_time = time.time()
         # 200ms of silence at 16kHz 16-bit mono = 6400 bytes of zeros
         silence_frame = b'\x00' * 6400
-        keepalive_interval = 3.0  # send silence every 3s when idle
-        logger.debug("_request_generator started.")
-        
+        keepalive_interval = 3.0
+
         while not self._finished.is_set() or not self._audio_q.empty():
             try:
                 chunk = self._audio_q.get(timeout=0.5)
@@ -141,12 +153,11 @@ class ChirpStreamer:
                             len(chunk),
                             self._audio_q.qsize(),
                         )
-                    yield speech.StreamingRecognizeRequest(audio_content=chunk)
+                    yield cloud_speech.StreamingRecognizeRequest(audio=chunk)
             except queue.Empty:
                 now = time.time()
-                # Send silence keepalive to prevent Google Audio Timeout
                 if now - last_audio_time >= keepalive_interval:
-                    yield speech.StreamingRecognizeRequest(audio_content=silence_frame)
+                    yield cloud_speech.StreamingRecognizeRequest(audio=silence_frame)
                     last_audio_time = now
                 if now - self._last_empty_log_ts >= 10:
                     logger.debug("Queue empty, sending keepalive. _finished=%s", self._finished.is_set())
@@ -160,14 +171,12 @@ class ChirpStreamer:
     def responses(self):
         """
         Start the streaming recognize call and return the response iterator.
-        
-        Returns:
-            Iterable of speech.StreamingRecognizeResponse.
         """
         try:
-            logger.debug("Starting streaming recognize call (v1 API)...")
-            streaming_config = self._get_streaming_config()
-            response_iterator = self._client.streaming_recognize(streaming_config, self._request_generator())
+            logger.debug("Starting streaming recognize call (v2 API)...")
+            response_iterator = self._client.streaming_recognize(
+                requests=self._request_generator(),
+            )
             logger.debug("Streaming recognize call started successfully.")
             return response_iterator
         except Exception as e:
@@ -176,29 +185,30 @@ class ChirpStreamer:
             raise
 
 
-def speaker_label_from_result(result: speech.StreamingRecognitionResult) -> Optional[str]:
+def speaker_label_from_result(result) -> Optional[str]:
     """
-    Extract a human-readable speaker label from a speech recognition result.
-    
-    Args:
-        result: A single streaming recognition result with diarization.
-    
+    Extract a human-readable speaker label from a v2 speech recognition result.
+
+    In v2, words have `speaker_label` (string like "1", "2") instead of v1's
+    `speaker_tag` (int).
+
     Returns:
         Speaker label like "Speaker A", "Speaker B", etc., or None if unavailable.
     """
     try:
         alt = result.alternatives[0]
         if alt.words:
-            tag = alt.words[-1].speaker_tag
-            if tag:
+            label = alt.words[-1].speaker_label
+            if label:
                 try:
+                    tag_num = int(label)
                     base = ord('A') - 1
-                    label = f"Speaker {chr(base + int(tag))}"
-                    logger.debug("speaker_label_from_result: tag=%s -> %s", tag, label)
-                    return label
-                except Exception:
-                    logger.debug("speaker_label_from_result: invalid tag=%s", tag)
-                    pass
+                    readable = f"Speaker {chr(base + tag_num)}"
+                    logger.debug("speaker_label_from_result: label=%s -> %s", label, readable)
+                    return readable
+                except ValueError:
+                    logger.debug("speaker_label_from_result: non-numeric label=%s", label)
+                    return f"Speaker {label}"
     except Exception:
         pass
     return None
