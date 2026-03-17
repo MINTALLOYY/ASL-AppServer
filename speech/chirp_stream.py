@@ -6,15 +6,14 @@ import logging
 import time
 from typing import Generator, Optional
 
-from google.cloud.speech_v2 import SpeechClient
-from google.cloud.speech_v2.types import cloud_speech
+from google.cloud import speech_v1 as speech
 
 logger = logging.getLogger(__name__)
 
 
 class ChirpStreamer:
     """
-    Streaming speech-to-text client using Google Cloud Speech v2.
+    Streaming speech-to-text client using Google Cloud Speech v1.
 
     Supports:
         - Real-time audio streaming via gRPC
@@ -23,23 +22,17 @@ class ChirpStreamer:
     """
     def __init__(
         self,
-        project_id: str = "",
         language_code: str = "en-US",
         sample_rate_hz: int = 16000,
         diarization_speaker_count: int = 2,
-        model: str = "long",
-        location: str = "global",
         audio_queue_maxsize: int = 256,
     ) -> None:
-        self.project_id = project_id
         self.language_code = language_code
         self.sample_rate_hz = sample_rate_hz
         self.diarization_speaker_count = diarization_speaker_count
-        self.model = model
-        self.location = location
         self.audio_queue_maxsize = max(16, int(audio_queue_maxsize))
 
-        self._client = SpeechClient()
+        self._client = speech.SpeechClient()
         self._audio_q: queue.Queue[bytes] = queue.Queue(maxsize=self.audio_queue_maxsize)
         self._finished = threading.Event()
         self._dropped_chunks = 0
@@ -90,54 +83,42 @@ class ChirpStreamer:
 
     def _get_streaming_config(self):
         """
-        Create the v2 streaming recognition config.
+        Create the streaming recognition config with speaker diarization.
+        Uses model=latest_long for best diarization accuracy.
         """
-        recognition_config = cloud_speech.RecognitionConfig(
-            explicit_decoding_config=cloud_speech.ExplicitDecodingConfig(
-                encoding=cloud_speech.ExplicitDecodingConfig.AudioEncoding.LINEAR16,
-                sample_rate_hertz=self.sample_rate_hz,
-                audio_channel_count=1,
-            ),
-            features=cloud_speech.RecognitionFeatures(
-                enable_automatic_punctuation=True,
-                diarization_config=cloud_speech.SpeakerDiarizationConfig(
-                    min_speaker_count=max(2, self.diarization_speaker_count),
-                    max_speaker_count=max(2, self.diarization_speaker_count),
-                ),
-            ),
-            language_codes=[self.language_code],
-            model=self.model,
+        diarization_config = speech.SpeakerDiarizationConfig(
+            enable_speaker_diarization=True,
+            min_speaker_count=max(2, self.diarization_speaker_count),
+            max_speaker_count=max(2, self.diarization_speaker_count),
         )
-        streaming_config = cloud_speech.StreamingRecognitionConfig(
-            config=recognition_config,
-            streaming_features=cloud_speech.StreamingRecognitionFeatures(
-                interim_results=False,
-            ),
+        rec_config = speech.RecognitionConfig(
+            encoding=speech.RecognitionConfig.AudioEncoding.LINEAR16,
+            sample_rate_hertz=self.sample_rate_hz,
+            language_code=self.language_code,
+            enable_automatic_punctuation=True,
+            model="latest_long",
+            diarization_config=diarization_config,
         )
-        logger.debug("v2 streaming config created: %s", streaming_config)
+        streaming_config = speech.StreamingRecognitionConfig(
+            config=rec_config,
+            interim_results=False,
+            single_utterance=False,
+        )
+        logger.debug("Streaming config: model=latest_long, speakers=%s", self.diarization_speaker_count)
         return streaming_config
 
-    def _request_generator(self) -> Generator[cloud_speech.StreamingRecognizeRequest, None, None]:
+    def _request_generator(self) -> Generator[speech.StreamingRecognizeRequest, None, None]:
         """
-        Generate streaming requests for Google Speech v2 gRPC API.
-        First request sends config, subsequent requests send audio.
+        Generate streaming requests for Google Speech gRPC API.
         Sends silent keepalive frames when idle to prevent Audio Timeout.
         """
-        recognizer = f"projects/{self.project_id}/locations/{self.location}/recognizers/_"
-
-        # First request: config only (no audio)
-        yield cloud_speech.StreamingRecognizeRequest(
-            recognizer=recognizer,
-            streaming_config=self._get_streaming_config(),
-        )
-        logger.debug("Sent v2 config request. recognizer=%s", recognizer)
-
         audio_passed = False
         chunk_count = 0
         last_audio_time = time.time()
         # 200ms of silence at 16kHz 16-bit mono = 6400 bytes of zeros
         silence_frame = b'\x00' * 6400
         keepalive_interval = 3.0
+        logger.debug("_request_generator started.")
 
         while not self._finished.is_set() or not self._audio_q.empty():
             try:
@@ -153,11 +134,11 @@ class ChirpStreamer:
                             len(chunk),
                             self._audio_q.qsize(),
                         )
-                    yield cloud_speech.StreamingRecognizeRequest(audio=chunk)
+                    yield speech.StreamingRecognizeRequest(audio_content=chunk)
             except queue.Empty:
                 now = time.time()
                 if now - last_audio_time >= keepalive_interval:
-                    yield cloud_speech.StreamingRecognizeRequest(audio=silence_frame)
+                    yield speech.StreamingRecognizeRequest(audio_content=silence_frame)
                     last_audio_time = now
                 if now - self._last_empty_log_ts >= 10:
                     logger.debug("Queue empty, sending keepalive. _finished=%s", self._finished.is_set())
@@ -173,10 +154,9 @@ class ChirpStreamer:
         Start the streaming recognize call and return the response iterator.
         """
         try:
-            logger.debug("Starting streaming recognize call (v2 API)...")
-            response_iterator = self._client.streaming_recognize(
-                requests=self._request_generator(),
-            )
+            logger.debug("Starting streaming recognize call (v1 API, model=latest_long)...")
+            streaming_config = self._get_streaming_config()
+            response_iterator = self._client.streaming_recognize(streaming_config, self._request_generator())
             logger.debug("Streaming recognize call started successfully.")
             return response_iterator
         except Exception as e:
@@ -185,12 +165,9 @@ class ChirpStreamer:
             raise
 
 
-def speaker_label_from_result(result) -> Optional[str]:
+def speaker_label_from_result(result: speech.StreamingRecognitionResult) -> Optional[str]:
     """
-    Extract a human-readable speaker label from a v2 speech recognition result.
-
-    In v2, words have `speaker_label` (string like "1", "2") instead of v1's
-    `speaker_tag` (int).
+    Extract a human-readable speaker label from a v1 speech recognition result.
 
     Returns:
         Speaker label like "Speaker A", "Speaker B", etc., or None if unavailable.
@@ -198,17 +175,16 @@ def speaker_label_from_result(result) -> Optional[str]:
     try:
         alt = result.alternatives[0]
         if alt.words:
-            label = alt.words[-1].speaker_label
-            if label:
+            tag = alt.words[-1].speaker_tag
+            if tag:
                 try:
-                    tag_num = int(label)
                     base = ord('A') - 1
-                    readable = f"Speaker {chr(base + tag_num)}"
-                    logger.debug("speaker_label_from_result: label=%s -> %s", label, readable)
-                    return readable
-                except ValueError:
-                    logger.debug("speaker_label_from_result: non-numeric label=%s", label)
-                    return f"Speaker {label}"
+                    label = f"Speaker {chr(base + int(tag))}"
+                    logger.debug("speaker_label_from_result: tag=%s -> %s", tag, label)
+                    return label
+                except Exception:
+                    logger.debug("speaker_label_from_result: invalid tag=%s", tag)
+                    pass
     except Exception:
         pass
     return None
