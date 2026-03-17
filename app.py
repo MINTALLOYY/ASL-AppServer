@@ -314,7 +314,11 @@ def speech_ws(ws):
     conversation_id: Optional[str] = request.args.get("conversation_id")
     # Mode state machine: 'identifying' or 'captioning'
     initial_mode = request.args.get("mode", "captioning")
-    num_speakers = int(request.args.get("num_speakers", 2))
+    try:
+        num_speakers = int(request.args.get("num_speakers", 2))
+    except Exception:
+        num_speakers = 2
+    num_speakers = max(2, min(6, num_speakers))
     if conversation_id:
         session_modes[conversation_id] = initial_mode
         identified_labels[conversation_id] = set()
@@ -327,8 +331,8 @@ def speech_ws(ws):
     except Exception:
         remote = None
     logger.info(
-        "WebSocket connection opened. conversation_id=%s, remote=%s, mode=%s",
-        conversation_id, remote, initial_mode,
+        "WebSocket connection opened. conversation_id=%s, remote=%s, mode=%s, num_speakers=%s",
+        conversation_id, remote, initial_mode, num_speakers,
     )
 
     # Background thread: consume responses from Google Speech and send to client
@@ -352,20 +356,30 @@ def speech_ws(ws):
                             try:
                                 alt = result.alternatives[0]
                                 if alt.words:
+                                    # Use the dominant speaker tag in this utterance to reduce
+                                    # accidental assignment when multiple voices overlap.
+                                    tag_counts = {}
                                     for word in alt.words:
-                                        tag = word.speaker_tag
-                                        if tag:
-                                            label = f"Speaker_{tag}"
-                                            seen = identified_labels.get(conversation_id, set())
-                                            if label not in seen:
-                                                seen.add(label)
-                                                identified_labels[conversation_id] = seen
-                                                ws.send(json.dumps({
-                                                    "event": "speaker_detected",
-                                                    "label": label,
-                                                }))
-                                                logger.info("speaker_detected: label=%s conversation_id=%s", label, conversation_id)
-                                                break  # one event per audio burst
+                                        tag = int(getattr(word, "speaker_tag", 0) or 0)
+                                        if tag > 0:
+                                            tag_counts[tag] = tag_counts.get(tag, 0) + 1
+                                    if tag_counts:
+                                        dominant_tag = max(tag_counts, key=tag_counts.get)
+                                        label = f"Speaker_{dominant_tag}"
+                                        seen = identified_labels.get(conversation_id, set())
+                                        if label not in seen:
+                                            seen.add(label)
+                                            identified_labels[conversation_id] = seen
+                                            ws.send(json.dumps({
+                                                "event": "speaker_detected",
+                                                "label": label,
+                                            }))
+                                            logger.info(
+                                                "speaker_detected: label=%s conversation_id=%s tag_counts=%s",
+                                                label,
+                                                conversation_id,
+                                                tag_counts,
+                                            )
                             except Exception as e:
                                 logger.error("Error in identifying mode: %s", e)
                             continue  # do NOT emit final_transcript during identification
