@@ -113,12 +113,18 @@ class ChirpStreamer:
     def _request_generator(self) -> Generator[speech.StreamingRecognizeRequest, None, None]:
         """
         Generate streaming requests for Google Speech gRPC API.
+        Sends silent keepalive frames when no real audio arrives to prevent
+        Google's Audio Timeout Error.
         
         Yields:
             speech.StreamingRecognizeRequest: Audio chunks.
         """
         audio_passed = False  # Track if any audio is passed
         chunk_count = 0
+        last_audio_time = time.time()
+        # 200ms of silence at 16kHz 16-bit mono = 6400 bytes of zeros
+        silence_frame = b'\x00' * 6400
+        keepalive_interval = 3.0  # send silence every 3s when idle
         logger.debug("_request_generator started.")
         
         while not self._finished.is_set() or not self._audio_q.empty():
@@ -127,6 +133,7 @@ class ChirpStreamer:
                 if chunk:
                     audio_passed = True
                     chunk_count += 1
+                    last_audio_time = time.time()
                     if chunk_count <= 3 or chunk_count % 25 == 0:
                         logger.debug(
                             "Sending audio chunk #%s of size: %s bytes. Queue size: %s",
@@ -137,8 +144,12 @@ class ChirpStreamer:
                     yield speech.StreamingRecognizeRequest(audio_content=chunk)
             except queue.Empty:
                 now = time.time()
+                # Send silence keepalive to prevent Google Audio Timeout
+                if now - last_audio_time >= keepalive_interval:
+                    yield speech.StreamingRecognizeRequest(audio_content=silence_frame)
+                    last_audio_time = now
                 if now - self._last_empty_log_ts >= 10:
-                    logger.debug("Queue empty. _finished=%s, queue_empty=%s", self._finished.is_set(), self._audio_q.empty())
+                    logger.debug("Queue empty, sending keepalive. _finished=%s", self._finished.is_set())
                     self._last_empty_log_ts = now
                 continue
 
