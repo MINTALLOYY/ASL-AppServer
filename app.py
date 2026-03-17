@@ -355,14 +355,20 @@ def speech_ws(ws):
                         if current_mode == "identifying":
                             try:
                                 alt = result.alternatives[0]
+                                transcript = (alt.transcript or "").strip()
                                 if alt.words:
-                                    # Use the dominant speaker tag in this utterance to reduce
-                                    # accidental assignment when multiple voices overlap.
+                                    # Log all word-level speaker tags for debugging
+                                    word_tags = [(w.word, int(getattr(w, "speaker_tag", 0) or 0)) for w in alt.words]
                                     tag_counts = {}
                                     for word in alt.words:
                                         tag = int(getattr(word, "speaker_tag", 0) or 0)
                                         if tag > 0:
                                             tag_counts[tag] = tag_counts.get(tag, 0) + 1
+                                    logger.info(
+                                        "IDENTIFY result: conversation_id=%s transcript='%s' word_tags=%s tag_counts=%s seen=%s",
+                                        conversation_id, transcript, word_tags, tag_counts,
+                                        identified_labels.get(conversation_id, set()),
+                                    )
                                     if tag_counts:
                                         dominant_tag = max(tag_counts, key=tag_counts.get)
                                         label = f"Speaker_{dominant_tag}"
@@ -375,11 +381,19 @@ def speech_ws(ws):
                                                 "label": label,
                                             }))
                                             logger.info(
-                                                "speaker_detected: label=%s conversation_id=%s tag_counts=%s",
-                                                label,
-                                                conversation_id,
-                                                tag_counts,
+                                                "speaker_detected SENT: label=%s conversation_id=%s tag_counts=%s",
+                                                label, conversation_id, tag_counts,
                                             )
+                                        else:
+                                            logger.info(
+                                                "speaker_detected SKIPPED (already seen): label=%s conversation_id=%s seen=%s",
+                                                label, conversation_id, seen,
+                                            )
+                                else:
+                                    logger.info(
+                                        "IDENTIFY result: no words in result. transcript='%s' conversation_id=%s",
+                                        transcript, conversation_id,
+                                    )
                             except Exception as e:
                                 logger.error("Error in identifying mode: %s", e)
                             continue  # do NOT emit final_transcript during identification
@@ -390,6 +404,13 @@ def speech_ws(ws):
                         except Exception:
                             transcript = ""
                         speaker = speaker_label_from_result(result)
+                        # Log diarization details for debugging
+                        try:
+                            if alt.words:
+                                word_tags = [(w.word, int(getattr(w, "speaker_tag", 0) or 0)) for w in alt.words[-5:]]
+                                logger.info("CAPTION result: speaker=%s transcript='%s' last_word_tags=%s", speaker, transcript[:80], word_tags)
+                        except Exception:
+                            pass
                         if transcript:
                             try:
                                 message = json.dumps({
@@ -513,6 +534,12 @@ def speech_ws(ws):
                     session_modes[conversation_id] = "captioning"
                     logger.info("Mode switched to captioning for conversation_id=%s", conversation_id)
                 ws.send(json.dumps({"event": "captioning_started"}))
+            elif event == "reset_identification":
+                # Clear seen labels so retries/re-identify work
+                if conversation_id:
+                    identified_labels[conversation_id] = set()
+                    logger.info("Reset identified_labels for conversation_id=%s", conversation_id)
+                ws.send(json.dumps({"event": "identification_reset"}))
             elif event == "set_conversation":
                 # Set or update conversation_id mid-session
                 cid = data.get("conversation_id")
