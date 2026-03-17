@@ -92,8 +92,8 @@ class ChirpStreamer:
         """
         diarization_config = speech.SpeakerDiarizationConfig(
             enable_speaker_diarization=True,
-            min_speaker_count=1,
-            max_speaker_count=max(1, self.diarization_speaker_count),
+            min_speaker_count=max(2, self.diarization_speaker_count),
+            max_speaker_count=max(2, self.diarization_speaker_count),
         )
         rec_config = speech.RecognitionConfig(
             encoding=speech.RecognitionConfig.AudioEncoding.LINEAR16,
