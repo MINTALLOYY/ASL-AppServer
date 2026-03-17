@@ -170,7 +170,7 @@ def speaker_label_from_result(result: speech.StreamingRecognitionResult) -> Opti
     Extract a human-readable speaker label from a v1 speech recognition result.
 
     Returns:
-        Speaker label like "Speaker A", "Speaker B", etc., or None if unavailable.
+        Speaker label like "Speaker_1", "Speaker_2", etc., or None if unavailable.
     """
     try:
         alt = result.alternatives[0]
@@ -178,8 +178,7 @@ def speaker_label_from_result(result: speech.StreamingRecognitionResult) -> Opti
             tag = alt.words[-1].speaker_tag
             if tag:
                 try:
-                    base = ord('A') - 1
-                    label = f"Speaker {chr(base + int(tag))}"
+                    label = f"Speaker_{int(tag)}"
                     logger.debug("speaker_label_from_result: tag=%s -> %s", tag, label)
                     return label
                 except Exception:
