@@ -77,23 +77,6 @@ if creds and creds.strip().startswith("{"):
     except Exception:
         pass
 
-# Extract GCP project ID for Speech v2 API
-def _get_gcp_project_id() -> str:
-    pid = os.environ.get("GOOGLE_CLOUD_PROJECT", "")
-    if pid:
-        return pid
-    creds_path = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS", "")
-    if creds_path and os.path.isfile(creds_path):
-        try:
-            with open(creds_path) as f:
-                return json.load(f).get("project_id", "")
-        except Exception:
-            pass
-    return ""
-
-GCP_PROJECT_ID = _get_gcp_project_id()
-logger.info("GCP project_id resolved: %s", GCP_PROJECT_ID or "(empty)")
-
 
 @app.get("/health")
 def health():
@@ -336,7 +319,7 @@ def speech_ws(ws):
         session_modes[conversation_id] = initial_mode
         identified_labels[conversation_id] = set()
     # Initialize Google Speech streaming client (with restart capability)
-    streamer_state = {"streamer": ChirpStreamer(project_id=GCP_PROJECT_ID, diarization_speaker_count=num_speakers), "active": True}
+    streamer_state = {"streamer": ChirpStreamer(diarization_speaker_count=num_speakers), "active": True}
 
     # Log when a new WebSocket connection opens
     try:
@@ -370,7 +353,7 @@ def speech_ws(ws):
                                 alt = result.alternatives[0]
                                 if alt.words:
                                     for word in alt.words:
-                                        tag = word.speaker_label  # v2: string label
+                                        tag = word.speaker_tag
                                         if tag:
                                             label = f"Speaker_{tag}"
                                             seen = identified_labels.get(conversation_id, set())
@@ -494,7 +477,7 @@ def speech_ws(ws):
                         except Exception:
                             pass
                         # Replace streamer and restart consumer thread
-                        streamer_state["streamer"] = ChirpStreamer(project_id=GCP_PROJECT_ID, diarization_speaker_count=num_speakers)
+                        streamer_state["streamer"] = ChirpStreamer(diarization_speaker_count=num_speakers)
                         streamer_state["active"] = True
                         t = threading.Thread(target=consume_responses, daemon=True)
                         t.start()
