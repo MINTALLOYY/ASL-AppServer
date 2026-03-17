@@ -314,11 +314,12 @@ def speech_ws(ws):
     conversation_id: Optional[str] = request.args.get("conversation_id")
     # Mode state machine: 'identifying' or 'captioning'
     initial_mode = request.args.get("mode", "captioning")
+    num_speakers = int(request.args.get("num_speakers", 2))
     if conversation_id:
         session_modes[conversation_id] = initial_mode
         identified_labels[conversation_id] = set()
     # Initialize Google Speech streaming client (with restart capability)
-    streamer_state = {"streamer": ChirpStreamer(), "active": True}
+    streamer_state = {"streamer": ChirpStreamer(diarization_speaker_count=num_speakers), "active": True}
 
     # Log when a new WebSocket connection opens
     try:
@@ -476,7 +477,7 @@ def speech_ws(ws):
                         except Exception:
                             pass
                         # Replace streamer and restart consumer thread
-                        streamer_state["streamer"] = ChirpStreamer()
+                        streamer_state["streamer"] = ChirpStreamer(diarization_speaker_count=num_speakers)
                         streamer_state["active"] = True
                         t = threading.Thread(target=consume_responses, daemon=True)
                         t.start()
