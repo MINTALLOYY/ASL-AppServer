@@ -1,19 +1,22 @@
 import cv2
 import numpy as np
 import logging
-from typing import Optional
-from asl.predictor import ASLPredictor
+from typing import Optional, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from asl.predictor import ASLPredictor
 
 logger = logging.getLogger(__name__)
 
 # Module-level predictor instance (lazy-loaded)
-_predictor: Optional[ASLPredictor] = None
+_predictor: Optional["ASLPredictor"] = None
 
 
-def get_predictor() -> ASLPredictor:
+def get_predictor() -> "ASLPredictor":
     """Return the shared ASLPredictor singleton, loading it on first call."""
     global _predictor
     if _predictor is None:
+        from asl.predictor import ASLPredictor
         import os
         base = os.path.dirname(__file__)
         _predictor = ASLPredictor(
