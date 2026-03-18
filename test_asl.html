@@ -22,6 +22,9 @@
     let frameCount = 0;
     let predCount = 0;
     let serverConfirmed = false;
+    const SEND_INTERVAL_MS = 100; // ~10 fps to reduce bandwidth/CPU pressure
+    const SEND_WIDTH = 256;
+    const SEND_HEIGHT = 256;
 
     const video  = document.getElementById('v');
     const status = document.getElementById('status');
@@ -66,6 +69,7 @@
         document.getElementById('connBtn').textContent = 'Connect';
         clearInterval(interval);
         serverConfirmed = false;
+        socket = null;
       };
       socket.onerror = (e) => {
         status.textContent = '🔴 Error — check console';
@@ -106,8 +110,8 @@
         if (!serverConfirmed) return;
         if (!video.videoWidth) return;
 
-        canvas.width = video.videoWidth;
-        canvas.height = video.videoHeight;
+        canvas.width = SEND_WIDTH;
+        canvas.height = SEND_HEIGHT;
         ctx.drawImage(video, 0, 0);
         canvas.toBlob(blob => {
           if (!blob) return;
@@ -121,7 +125,7 @@
           };
           reader.readAsDataURL(blob);
         }, 'image/jpeg', 0.5);
-      }, 67);
+      }, SEND_INTERVAL_MS);
     }
   </script>
 </body>
