@@ -371,13 +371,35 @@ def asl_ws(ws):
 
     frame_buffer = deque(maxlen=SEQUENCE_LENGTH)
     frame_count = 0
+    msg_count = 0
+    last_idle_log_at = 0.0
+    last_ping_at = 0.0
+    receive_timeout_sec = 15
 
     ws.send(json.dumps({"event": "connected"}))
     logger.info("ASL-WS sent connected event")
 
     try:
         while True:
-            msg = ws.receive()
+            msg_count += 1
+            try:
+                msg = ws.receive(timeout=receive_timeout_sec)
+            except TimeoutError:
+                now = time.time()
+                if now - last_idle_log_at >= 30:
+                    logger.info(
+                        "ASL-WS idle for %ss waiting for frames. remote=%s",
+                        receive_timeout_sec,
+                        request.remote_addr,
+                    )
+                    last_idle_log_at = now
+
+                # Keepalive for proxies/load balancers that close quiet websocket connections.
+                if now - last_ping_at >= 25:
+                    ws.send(json.dumps({"event": "ping", "ts": int(now)}))
+                    last_ping_at = now
+                continue
+
             if msg is None:
                 logger.info("ASL WebSocket client disconnected")
                 break
@@ -431,6 +453,9 @@ def asl_ws(ws):
                 frame_count = 0
                 logger.info("ASL frame buffer reset")
 
+            elif event in ("pong", "heartbeat"):
+                logger.debug("ASL-WS heartbeat received")
+
             elif event in ("end", "finish", "close"):
                 logger.info("ASL WebSocket session ended by client")
                 break
@@ -438,10 +463,10 @@ def asl_ws(ws):
             else:
                 logger.debug("ASL WS: unknown event '%s'", event)
 
-    except Exception:
-        logger.exception("Exception in ASL WebSocket handler")
+    except Exception as e:
+        logger.exception("Exception in ASL WebSocket handler: %s", e)
     finally:
-        logger.info("ASL WebSocket connection closed")
+        logger.info("ASL WebSocket connection closed. frames=%s messages=%s", frame_count, msg_count)
 
 
 @sock.route("/speech/ws")

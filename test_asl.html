@@ -60,8 +60,9 @@
         status.textContent = '🟡 Socket open, waiting for server event...';
         document.getElementById('connBtn').textContent = 'Disconnect';
       };
-      socket.onclose = () => {
-        status.textContent = '🔴 Disconnected';
+      socket.onclose = (e) => {
+        status.textContent = `🔴 Disconnected (code=${e.code}, reason=${e.reason || 'none'})`;
+        console.warn('WebSocket closed:', e.code, e.reason);
         document.getElementById('connBtn').textContent = 'Connect';
         clearInterval(interval);
         serverConfirmed = false;
@@ -78,6 +79,8 @@
             pc.textContent = predCount;
             out.textContent += data.word + ' ';
             console.log('Prediction:', data.word, 'confidence:', data.confidence);
+          } else if (data.event === 'ping') {
+            socket.send(JSON.stringify({event: 'pong', ts: data.ts}));
           } else if (data.event === 'connected') {
             serverConfirmed = true;
             status.textContent = '🟢 Connected to /asl/ws';
