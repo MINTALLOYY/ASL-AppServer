@@ -105,6 +105,8 @@
               status.textContent = '🟡 Connected, loading ASL model...';
             } else if (data.phase === 'ready') {
               status.textContent = `🟢 ASL model ready (${data.backend || 'unknown'})`;
+            } else if (data.phase === 'runtime_error') {
+              status.textContent = '🔴 ASL runtime incompatible (deploy Python 3.11.x)';
             } else if (data.phase === 'error') {
               status.textContent = '🔴 ASL model failed to initialize';
             }

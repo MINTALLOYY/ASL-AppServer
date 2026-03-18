@@ -103,11 +103,19 @@ def asl_diagnostics():
     Quick readiness endpoint for ASL model + MediaPipe compatibility.
     Use ?load_predictor=1 to force model initialization.
     """
+    py_version = platform.python_version()
     info = {
-        "python_version": platform.python_version(),
+        "python_version": py_version,
+        "recommended_python": "3.11.x",
         "model_path": os.path.join(os.path.dirname(__file__), "asl", "asl_model.keras"),
         "labels_path": os.path.join(os.path.dirname(__file__), "asl", "label_map.json"),
+        "load_predictor_url": f"{request.base_url}?load_predictor=1",
     }
+    try:
+        major, minor = [int(x) for x in py_version.split(".")[:2]]
+        info["python_compatible"] = (major, minor) <= (3, 11)
+    except Exception:
+        info["python_compatible"] = None
     load_predictor = (request.args.get("load_predictor") or "").strip().lower() in {"1", "true", "yes"}
     info["predictor_load_requested"] = load_predictor
     try:
@@ -129,6 +137,8 @@ def asl_diagnostics():
         info["predictor_backend"] = getattr(predictor, "backend", "unknown")
         info["feature_dim"] = int(getattr(predictor, "feature_dim", -1))
         info["num_classes"] = int(getattr(predictor, "num_classes", -1))
+        info["runtime_inference_ok"] = bool(getattr(predictor, "runtime_inference_ok", True))
+        info["runtime_issue"] = getattr(predictor, "runtime_issue", "")
         return jsonify(info)
     except Exception as e:
         info["predictor_loaded"] = False
@@ -387,6 +397,15 @@ def asl_ws(ws):
             "phase": "ready",
             "backend": getattr(predictor, "backend", "unknown"),
         }))
+        if not bool(getattr(predictor, "runtime_inference_ok", True)):
+            issue = getattr(predictor, "runtime_issue", "ASL runtime check failed")
+            logger.error("[%s] PREDICTOR runtime_invalid: %s", conn_id, issue)
+            ws.send(json.dumps({"event": "asl_status", "phase": "runtime_error"}))
+            ws.send(json.dumps({
+                "event": "error",
+                "message": issue,
+            }))
+            return
     except Exception as e:
         logger.exception("[%s] PREDICTOR init_failed: %s", conn_id, e)
         ws.send(json.dumps({"event": "asl_status", "phase": "error"}))
