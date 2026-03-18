@@ -1,6 +1,7 @@
 import base64
 import json
 import os
+import platform
 import tempfile
 import threading
 import time
@@ -94,6 +95,38 @@ def health():
     if creds:
         return jsonify({"status": "ok and creds"})
     return jsonify({"status": "server running but no credentials"}), 500
+
+
+@app.get("/asl/diagnostics")
+def asl_diagnostics():
+    """
+    Quick readiness endpoint for ASL model + MediaPipe compatibility.
+    """
+    info = {
+        "python_version": platform.python_version(),
+        "model_path": os.path.join(os.path.dirname(__file__), "asl", "asl_model.keras"),
+        "labels_path": os.path.join(os.path.dirname(__file__), "asl", "label_map.json"),
+    }
+    try:
+        import mediapipe as mp
+
+        info["mediapipe_version"] = getattr(mp, "__version__", "unknown")
+        info["mediapipe_has_solutions"] = hasattr(mp, "solutions")
+    except Exception as e:
+        info["mediapipe_import_error"] = str(e)
+
+    try:
+        predictor = get_predictor()
+        info["predictor_loaded"] = True
+        info["predictor_backend"] = getattr(predictor, "backend", "unknown")
+        info["feature_dim"] = int(getattr(predictor, "feature_dim", -1))
+        info["num_classes"] = int(getattr(predictor, "num_classes", -1))
+        return jsonify(info)
+    except Exception as e:
+        info["predictor_loaded"] = False
+        info["predictor_error"] = str(e)
+        logger.exception("ASL diagnostics failed: %s", e)
+        return jsonify(info), 500
 
 
 @app.route("/asl/test", methods=["GET"], strict_slashes=False)
