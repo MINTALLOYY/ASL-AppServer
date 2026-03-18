@@ -28,9 +28,9 @@
     let frameCount = 0;
     let predCount = 0;
     let serverConfirmed = false;
-    const SEND_INTERVAL_MS = 100; // ~10 fps to reduce bandwidth/CPU pressure
-    const SEND_WIDTH = 256;
-    const SEND_HEIGHT = 256;
+    const SEND_INTERVAL_MS = 120; // ~8.3 fps to preserve quality under bandwidth limits
+    const SEND_WIDTH = 384;
+    const SEND_HEIGHT = 288;
 
     const video  = document.getElementById('v');
     const status = document.getElementById('status');
@@ -100,11 +100,19 @@
             console.log('Prediction:', data.word, 'confidence:', data.confidence);
           } else if (data.event === 'asl_debug_landmarks') {
             drawLandmarks(data.hands || {}, data.connections || []);
+          } else if (data.event === 'asl_status') {
+            if (data.phase === 'loading_model') {
+              status.textContent = '🟡 Connected, loading ASL model...';
+            } else if (data.phase === 'ready') {
+              status.textContent = `🟢 ASL model ready (${data.backend || 'unknown'})`;
+            } else if (data.phase === 'error') {
+              status.textContent = '🔴 ASL model failed to initialize';
+            }
           } else if (data.event === 'ping') {
             socket.send(JSON.stringify({event: 'pong', ts: data.ts}));
           } else if (data.event === 'connected') {
             serverConfirmed = true;
-            status.textContent = '🟢 Connected to /asl/ws';
+            status.textContent = '🟡 Connected to /asl/ws';
             console.log('Server confirmed /asl/ws connection');
             startStreaming();
           } else if (data.event === 'error') {
@@ -134,7 +142,7 @@
 
         canvas.width = SEND_WIDTH;
         canvas.height = SEND_HEIGHT;
-        ctx.drawImage(video, 0, 0);
+        ctx.drawImage(video, 0, 0, SEND_WIDTH, SEND_HEIGHT);
         canvas.toBlob(blob => {
           if (!blob) return;
           const reader = new FileReader();
@@ -146,7 +154,7 @@
             fc.textContent = frameCount;
           };
           reader.readAsDataURL(blob);
-        }, 'image/jpeg', 0.5);
+        }, 'image/jpeg', 0.85);
       }, SEND_INTERVAL_MS);
     }
 

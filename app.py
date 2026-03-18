@@ -368,6 +368,11 @@ def asl_ws(ws):
     remote = request.remote_addr
     logger.info("[%s] OPEN remote=%s path=/asl/ws", conn_id, remote)
 
+    # Ack immediately so clients are not stuck waiting while model loads.
+    ws.send(json.dumps({"event": "connected"}))
+    ws.send(json.dumps({"event": "asl_status", "phase": "loading_model"}))
+    logger.info("[%s] TX connected + loading_model", conn_id)
+
     try:
         predictor = get_predictor()
         logger.info(
@@ -377,8 +382,14 @@ def asl_ws(ws):
             getattr(predictor, "feature_dim", "unknown"),
             getattr(predictor, "num_classes", "unknown"),
         )
+        ws.send(json.dumps({
+            "event": "asl_status",
+            "phase": "ready",
+            "backend": getattr(predictor, "backend", "unknown"),
+        }))
     except Exception as e:
         logger.exception("[%s] PREDICTOR init_failed: %s", conn_id, e)
+        ws.send(json.dumps({"event": "asl_status", "phase": "error"}))
         ws.send(json.dumps({"event": "error", "message": "Model failed to load"}))
         return
 
@@ -404,9 +415,6 @@ def asl_ws(ws):
     heartbeat_sent = 0
     heartbeat_recv = 0
     zero_keypoint_streak = 0
-
-    ws.send(json.dumps({"event": "connected"}))
-    logger.info("[%s] TX connected", conn_id)
 
     try:
         while True:
@@ -524,6 +532,16 @@ def asl_ws(ws):
                         and frame_count % STRIDE == 0):
                     infer_windows += 1
                     seq = np.expand_dims(np.array(frame_buffer), axis=0)
+
+                    # Avoid model invocation on pure-zero windows; these produce unstable outputs.
+                    if not np.any(seq):
+                        logger.warning(
+                            "[%s] INFER skipped: zero-signal window (no landmarks in last %s frames)",
+                            conn_id,
+                            SEQUENCE_LENGTH,
+                        )
+                        continue
+
                     with predictor._infer_lock:
                         probs = predictor.model.predict(seq, verbose=0)[0]
 
