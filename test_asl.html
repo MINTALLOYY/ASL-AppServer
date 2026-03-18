@@ -6,9 +6,15 @@
     <label>Server URL:
       <input id="url" value="" style="width:350px;padding:4px;font-family:monospace">
     </label>
+    <label style="margin-left:10px">
+      <input type="checkbox" id="viz" checked> Show hand traces
+    </label>
     <button onclick="toggleConnection()" id="connBtn">Connect</button>
   </div>
-  <video id="v" autoplay width="320" style="border:1px solid #444"></video>
+  <div style="position:relative;display:inline-block">
+    <video id="v" autoplay width="320" style="border:1px solid #444;display:block"></video>
+    <canvas id="overlay" width="320" height="240" style="position:absolute;left:0;top:0;pointer-events:none"></canvas>
+  </div>
   <div id="status" style="margin:10px 0;color:#aaa">Disconnected</div>
   <div style="margin:4px 0;color:#666;font-size:12px">
     Frames sent: <span id="fc">0</span> | Predictions: <span id="pc">0</span>
@@ -32,8 +38,11 @@
     const fc     = document.getElementById('fc');
     const pc     = document.getElementById('pc');
     const urlInput = document.getElementById('url');
+    const vizInput = document.getElementById('viz');
     const canvas = document.createElement('canvas');
     const ctx    = canvas.getContext('2d');
+    const overlay = document.getElementById('overlay');
+    const octx = overlay.getContext('2d');
     if (location.protocol.startsWith('http')) {
       const wsScheme = location.protocol === 'https:' ? 'wss' : 'ws';
       urlInput.value = `${wsScheme}://${location.host}/asl/ws`;
@@ -55,7 +64,13 @@
     }
 
     function connect() {
-      const url = document.getElementById('url').value;
+      let url = document.getElementById('url').value;
+      if (vizInput.checked) {
+        const hasQuery = url.includes('?');
+        if (!url.includes('debug=')) {
+          url = `${url}${hasQuery ? '&' : '?'}debug=1`;
+        }
+      }
       status.textContent = '🟡 Connecting...';
       socket = new WebSocket(url);
 
@@ -83,6 +98,8 @@
             pc.textContent = predCount;
             out.textContent += data.word + ' ';
             console.log('Prediction:', data.word, 'confidence:', data.confidence);
+          } else if (data.event === 'asl_debug_landmarks') {
+            drawLandmarks(data.hands || {}, data.connections || []);
           } else if (data.event === 'ping') {
             socket.send(JSON.stringify({event: 'pong', ts: data.ts}));
           } else if (data.event === 'connected') {
@@ -103,6 +120,11 @@
       navigator.mediaDevices.getUserMedia({video: true}).then(stream => {
         video.srcObject = stream;
       });
+
+      video.onloadedmetadata = () => {
+        overlay.width = video.clientWidth || 320;
+        overlay.height = video.clientHeight || 240;
+      };
 
       // Send a frame every ~67ms = ~15fps
       interval = setInterval(() => {
@@ -126,6 +148,38 @@
           reader.readAsDataURL(blob);
         }, 'image/jpeg', 0.5);
       }, SEND_INTERVAL_MS);
+    }
+
+    function drawLandmarks(hands, connections) {
+      const w = overlay.width;
+      const h = overlay.height;
+      octx.clearRect(0, 0, w, h);
+
+      drawHand(hands.left || [], '#00ff88', connections, w, h);
+      drawHand(hands.right || [], '#00b7ff', connections, w, h);
+    }
+
+    function drawHand(points, color, connections, w, h) {
+      if (!points || points.length === 0) return;
+
+      octx.strokeStyle = color;
+      octx.lineWidth = 2;
+      for (const pair of connections) {
+        const a = points[pair[0]];
+        const b = points[pair[1]];
+        if (!a || !b) continue;
+        octx.beginPath();
+        octx.moveTo(a[0] * w, a[1] * h);
+        octx.lineTo(b[0] * w, b[1] * h);
+        octx.stroke();
+      }
+
+      octx.fillStyle = color;
+      for (const p of points) {
+        octx.beginPath();
+        octx.arc(p[0] * w, p[1] * h, 3, 0, Math.PI * 2);
+        octx.fill();
+      }
     }
   </script>
 </body>

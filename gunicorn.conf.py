@@ -10,7 +10,7 @@ import os
 worker_class = "gthread"
 
 # Threads per worker
-threads = int(os.environ.get("WEB_THREADS", 8))
+threads = int(os.environ.get("WEB_THREADS", 2))
 
 # Single worker to stay within Render free-tier memory limits
 workers = int(os.environ.get("WEB_CONCURRENCY", 1))
