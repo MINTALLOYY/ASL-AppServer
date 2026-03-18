@@ -6,6 +6,7 @@ import numpy as np
 import mediapipe as mp
 import platform
 import tempfile
+import threading
 import urllib.request
 from tensorflow.keras.models import load_model
 from collections import deque
@@ -72,6 +73,7 @@ class ASLPredictor:
             self.holistic = None
         self.frame_buffer = deque(maxlen=SEQUENCE_LENGTH)
         self.frame_count = 0
+        self._infer_lock = threading.Lock()
 
     @property
     def backend(self) -> str:
@@ -126,11 +128,12 @@ class ASLPredictor:
 
     def _extract_keypoints(self, frame_bgr: np.ndarray) -> np.ndarray:
         """Run MediaPipe on a BGR frame and return vector sized to model feature_dim."""
-        rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-        if self._backend == "tasks":
-            return self._extract_keypoints_tasks(rgb)
+        with self._infer_lock:
+            rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+            if self._backend == "tasks":
+                return self._extract_keypoints_tasks(rgb)
 
-        results = self.holistic.process(rgb)
+            results = self.holistic.process(rgb)
 
         def lm_array(lm_list, n):
             if lm_list:
@@ -238,8 +241,9 @@ class ASLPredictor:
             )
 
         if (len(self.frame_buffer) == SEQUENCE_LENGTH
-                and self.frame_count % STRIDE == 0):
+            and self.frame_count % STRIDE == 0):
             seq = np.expand_dims(np.array(self.frame_buffer), axis=0)  # (1, 30, 126)
+            with self._infer_lock:
             probs = self.model.predict(seq, verbose=0)[0]
             best = int(np.argmax(probs))
             conf = float(probs[best])
