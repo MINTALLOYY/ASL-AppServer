@@ -1,0 +1,125 @@
+<!DOCTYPE html>
+<html>
+<body style="font-family:monospace;background:#111;color:#eee;padding:20px">
+  <h2>ASL Server Test</h2>
+  <div style="margin-bottom:10px">
+    <label>Server URL:
+      <input id="url" value="" style="width:350px;padding:4px;font-family:monospace">
+    </label>
+    <button onclick="toggleConnection()" id="connBtn">Connect</button>
+  </div>
+  <video id="v" autoplay width="320" style="border:1px solid #444"></video>
+  <div id="status" style="margin:10px 0;color:#aaa">Disconnected</div>
+  <div style="margin:4px 0;color:#666;font-size:12px">
+    Frames sent: <span id="fc">0</span> | Predictions: <span id="pc">0</span>
+  </div>
+  <div id="out" style="font-size:28px;color:#00ff88;min-height:40px;margin:10px 0"></div>
+  <button onclick="document.getElementById('out').textContent=''">Clear</button>
+
+  <script>
+    let socket = null;
+    let interval = null;
+    let frameCount = 0;
+    let predCount = 0;
+    let serverConfirmed = false;
+
+    const video  = document.getElementById('v');
+    const status = document.getElementById('status');
+    const out    = document.getElementById('out');
+    const fc     = document.getElementById('fc');
+    const pc     = document.getElementById('pc');
+    const urlInput = document.getElementById('url');
+    const canvas = document.createElement('canvas');
+    const ctx    = canvas.getContext('2d');
+    if (location.protocol.startsWith('http')) {
+      const wsScheme = location.protocol === 'https:' ? 'wss' : 'ws';
+      urlInput.value = `${wsScheme}://${location.host}/asl/ws`;
+    } else {
+      urlInput.value = 'ws://127.0.0.1:5000/asl/ws';
+    }
+
+    function toggleConnection() {
+      if (socket && socket.readyState <= 1) {
+        socket.send(JSON.stringify({event: 'end'}));
+        socket.close();
+        socket = null;
+        clearInterval(interval);
+        document.getElementById('connBtn').textContent = 'Connect';
+        status.textContent = '🔴 Disconnected';
+        return;
+      }
+      connect();
+    }
+
+    function connect() {
+      const url = document.getElementById('url').value;
+      status.textContent = '🟡 Connecting...';
+      socket = new WebSocket(url);
+
+      socket.onopen = () => {
+        status.textContent = '🟡 Socket open, waiting for server event...';
+        document.getElementById('connBtn').textContent = 'Disconnect';
+      };
+      socket.onclose = () => {
+        status.textContent = '🔴 Disconnected';
+        document.getElementById('connBtn').textContent = 'Connect';
+        clearInterval(interval);
+        serverConfirmed = false;
+      };
+      socket.onerror = (e) => {
+        status.textContent = '🔴 Error — check console';
+        console.error('WebSocket error:', e);
+      };
+      socket.onmessage = (e) => {
+        try {
+          const data = JSON.parse(e.data);
+          if (data.event === 'asl_result') {
+            predCount++;
+            pc.textContent = predCount;
+            out.textContent += data.word + ' ';
+            console.log('Prediction:', data.word, 'confidence:', data.confidence);
+          } else if (data.event === 'connected') {
+            serverConfirmed = true;
+            status.textContent = '🟢 Connected to /asl/ws';
+            console.log('Server confirmed /asl/ws connection');
+            startStreaming();
+          } else if (data.event === 'error') {
+            status.textContent = '🔴 Server error: ' + data.message;
+          }
+        } catch (err) {
+          console.log('Non-JSON message:', e.data);
+        }
+      };
+    }
+
+    function startStreaming() {
+      navigator.mediaDevices.getUserMedia({video: true}).then(stream => {
+        video.srcObject = stream;
+      });
+
+      // Send a frame every ~67ms = ~15fps
+      interval = setInterval(() => {
+        if (!socket || socket.readyState !== 1) return;
+        if (!serverConfirmed) return;
+        if (!video.videoWidth) return;
+
+        canvas.width = video.videoWidth;
+        canvas.height = video.videoHeight;
+        ctx.drawImage(video, 0, 0);
+        canvas.toBlob(blob => {
+          if (!blob) return;
+          const reader = new FileReader();
+          reader.onloadend = () => {
+            // reader.result is a data URL: "data:image/jpeg;base64,..."
+            const b64 = reader.result.split(',')[1];
+            socket.send(JSON.stringify({event: 'asl_frame', frame: b64}));
+            frameCount++;
+            fc.textContent = frameCount;
+          };
+          reader.readAsDataURL(blob);
+        }, 'image/jpeg', 0.5);
+      }, 67);
+    }
+  </script>
+</body>
+</html>
