@@ -127,6 +127,9 @@ class ASLPredictor:
                 base_options=mp_tasks_python.BaseOptions(model_asset_path=hand_model_path),
                 running_mode=mp_tasks_vision.RunningMode.IMAGE,
                 num_hands=2,
+                min_hand_detection_confidence=0.2,
+                min_hand_presence_confidence=0.2,
+                min_tracking_confidence=0.2,
             )
         )
 
@@ -258,6 +261,7 @@ class ASLPredictor:
         debug = {
             "left": left_pts,
             "right": right_pts,
+            "detected": int(len(hand_result.hand_landmarks)),
         }
         return feats.astype(np.float32), debug
 
