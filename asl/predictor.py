@@ -244,7 +244,7 @@ class ASLPredictor:
             and self.frame_count % STRIDE == 0):
             seq = np.expand_dims(np.array(self.frame_buffer), axis=0)  # (1, 30, 126)
             with self._infer_lock:
-            probs = self.model.predict(seq, verbose=0)[0]
+                probs = self.model.predict(seq, verbose=0)[0]
             best = int(np.argmax(probs))
             conf = float(probs[best])
             candidate = self.labels.get(best, f"unknown_{best}")
