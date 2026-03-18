@@ -86,10 +86,43 @@ class ASLPredictor:
         self.frame_buffer = deque(maxlen=SEQUENCE_LENGTH)
         self.frame_count = 0
         self._infer_lock = threading.Lock()
+        self.runtime_inference_ok = True
+        self.runtime_issue = ""
+        self._run_runtime_sanity_check()
 
     @property
     def backend(self) -> str:
         return self._backend
+
+    def _run_runtime_sanity_check(self) -> None:
+        """Detect broken TF runtime early (e.g. all-NaN outputs on valid tensors)."""
+        try:
+            zero_seq = np.zeros((1, SEQUENCE_LENGTH, self.feature_dim), dtype=np.float32)
+            rand_seq = np.random.rand(1, SEQUENCE_LENGTH, self.feature_dim).astype(np.float32)
+            with self._infer_lock:
+                out_zero = self.model.predict(zero_seq, verbose=0)[0]
+                out_rand = self.model.predict(rand_seq, verbose=0)[0]
+
+            zero_ok = bool(np.isfinite(out_zero).all())
+            rand_ok = bool(np.isfinite(out_rand).all())
+            if not (zero_ok and rand_ok):
+                self.runtime_inference_ok = False
+                self.runtime_issue = (
+                    "Model outputs are non-finite (NaN/Inf). "
+                    "This commonly indicates an incompatible TensorFlow/Python runtime. "
+                    "Use Python 3.11.x on Render and redeploy."
+                )
+                logger.error(
+                    "ASL runtime sanity check failed: zero_finite=%s rand_finite=%s zero_nan=%s rand_nan=%s",
+                    zero_ok,
+                    rand_ok,
+                    int(np.isnan(out_zero).sum()),
+                    int(np.isnan(out_rand).sum()),
+                )
+        except Exception as exc:
+            self.runtime_inference_ok = False
+            self.runtime_issue = f"Runtime sanity check exception: {exc}"
+            logger.exception("ASL runtime sanity check raised exception: %s", exc)
 
     def _ensure_task_model(self, filename: str, url: str) -> str:
         model_dir = os.path.join(tempfile.gettempdir(), "asl_mediapipe_models")
