@@ -355,12 +355,22 @@ def asl_ws(ws):
         - {"event": "connected"}
         - {"event": "error", "message": "..."}
     """
-    logger.info("ASL WebSocket connection opened. remote=%s", request.remote_addr)
+    conn_started_at = time.time()
+    conn_id = f"aslws-{int(conn_started_at * 1000)}-{(id(ws) % 100000)}"
+    remote = request.remote_addr
+    logger.info("[%s] OPEN remote=%s path=/asl/ws", conn_id, remote)
 
     try:
         predictor = get_predictor()
+        logger.info(
+            "[%s] PREDICTOR ready backend=%s feature_dim=%s classes=%s",
+            conn_id,
+            getattr(predictor, "backend", "unknown"),
+            getattr(predictor, "feature_dim", "unknown"),
+            getattr(predictor, "num_classes", "unknown"),
+        )
     except Exception as e:
-        logger.exception("Failed to load ASL predictor: %s", e)
+        logger.exception("[%s] PREDICTOR init_failed: %s", conn_id, e)
         ws.send(json.dumps({"event": "error", "message": "Model failed to load"}))
         return
 
@@ -375,9 +385,16 @@ def asl_ws(ws):
     last_idle_log_at = 0.0
     last_ping_at = 0.0
     receive_timeout_sec = 15
+    keepalive_interval_sec = 12
+    last_frame_at = conn_started_at
+    decode_failures = 0
+    infer_windows = 0
+    predictions_sent = 0
+    heartbeat_sent = 0
+    heartbeat_recv = 0
 
     ws.send(json.dumps({"event": "connected"}))
-    logger.info("ASL-WS sent connected event")
+    logger.info("[%s] TX connected", conn_id)
 
     try:
         while True:
@@ -388,36 +405,53 @@ def asl_ws(ws):
                 now = time.time()
                 if now - last_idle_log_at >= 30:
                     logger.info(
-                        "ASL-WS idle for %ss waiting for frames. remote=%s",
+                        "[%s] IDLE wait=%ss since_last_frame=%.1fs messages=%s frames=%s",
+                        conn_id,
                         receive_timeout_sec,
-                        request.remote_addr,
+                        now - last_frame_at,
+                        msg_count,
+                        frame_count,
                     )
                     last_idle_log_at = now
 
                 # Keepalive for proxies/load balancers that close quiet websocket connections.
-                if now - last_ping_at >= 25:
+                if now - last_ping_at >= keepalive_interval_sec:
                     ws.send(json.dumps({"event": "ping", "ts": int(now)}))
                     last_ping_at = now
+                    heartbeat_sent += 1
+                    logger.info("[%s] TX ping count=%s", conn_id, heartbeat_sent)
                 continue
 
             if msg is None:
-                logger.info("ASL WebSocket client disconnected")
+                logger.info("[%s] CLIENT disconnected (receive returned None)", conn_id)
                 break
 
             try:
                 data = json.loads(msg)
             except Exception:
-                logger.debug("ASL WS: non-JSON message (len=%d)", len(msg) if msg else 0)
+                logger.info("[%s] RX non_json len=%s", conn_id, len(msg) if msg else 0)
                 continue
 
             event = data.get("event")
+            now = time.time()
+
+            if now - last_ping_at >= keepalive_interval_sec:
+                ws.send(json.dumps({"event": "ping", "ts": int(now)}))
+                last_ping_at = now
+                heartbeat_sent += 1
+                logger.info("[%s] TX ping count=%s", conn_id, heartbeat_sent)
 
             if event == "asl_frame":
-                if frame_count % 15 == 0:
-                    logger.info("ASL-WS received asl_frame frame_count=%s", frame_count)
+                if frame_count % 10 == 0:
+                    logger.info(
+                        "[%s] RX frame idx=%s b64_len=%s",
+                        conn_id,
+                        frame_count,
+                        len(data.get("frame") or ""),
+                    )
                 frame_b64 = data.get("frame")
                 if not frame_b64:
-                    logger.warning("ASL-WS asl_frame missing frame payload")
+                    logger.warning("[%s] RX frame missing_payload", conn_id)
                     continue
 
                 frame_bytes = base64.b64decode(frame_b64)
@@ -425,48 +459,96 @@ def asl_ws(ws):
                 import cv2
                 frame = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
                 if frame is None:
-                    logger.warning("ASL-WS cv2.imdecode returned None")
+                    decode_failures += 1
+                    logger.warning(
+                        "[%s] DECODE failed bytes=%s failures=%s",
+                        conn_id,
+                        len(frame_bytes),
+                        decode_failures,
+                    )
                     continue
 
                 keypoints = predictor._extract_keypoints(frame)
+                last_frame_at = time.time()
                 frame_buffer.append(keypoints)
                 frame_count += 1
 
+                if frame_count % 10 == 0:
+                    logger.info(
+                        "[%s] KEYPOINTS frame=%s nonzero=%s feature_dim=%s",
+                        conn_id,
+                        frame_count,
+                        int(np.count_nonzero(keypoints)),
+                        len(keypoints),
+                    )
+
                 if (len(frame_buffer) == SEQUENCE_LENGTH
                         and frame_count % STRIDE == 0):
+                    infer_windows += 1
                     seq = np.expand_dims(np.array(frame_buffer), axis=0)
-                    probs = predictor.model.predict(seq, verbose=0)[0]
+                    with predictor._infer_lock:
+                        probs = predictor.model.predict(seq, verbose=0)[0]
                     best = int(np.argmax(probs))
                     conf = float(probs[best])
+                    best_word = predictor.labels.get(best, f"unknown_{best}")
+                    logger.info(
+                        "[%s] INFER window=%s best=%s conf=%.3f threshold=%.2f",
+                        conn_id,
+                        infer_windows,
+                        best_word,
+                        conf,
+                        CONFIDENCE,
+                    )
                     if conf >= CONFIDENCE:
-                        word = predictor.labels.get(best, f"unknown_{best}")
-                        logger.info("ASL prediction: %s (%.2f)", word, conf)
-                        logger.info("ASL-WS emitted asl_result word=%s conf=%.3f", word, conf)
+                        word = best_word
+                        predictions_sent += 1
+                        logger.info(
+                            "[%s] TX asl_result word=%s conf=%.3f total_predictions=%s",
+                            conn_id,
+                            word,
+                            conf,
+                            predictions_sent,
+                        )
                         ws.send(json.dumps({
                             "event": "asl_result",
                             "word": word,
                             "confidence": round(conf, 3),
                         }))
+                    else:
+                        logger.info("[%s] INFER below_threshold conf=%.3f", conn_id, conf)
 
             elif event == "reset":
                 frame_buffer.clear()
                 frame_count = 0
-                logger.info("ASL frame buffer reset")
+                logger.info("[%s] RX reset -> frame_buffer_cleared", conn_id)
 
             elif event in ("pong", "heartbeat"):
-                logger.debug("ASL-WS heartbeat received")
+                heartbeat_recv += 1
+                logger.info("[%s] RX %s count=%s", conn_id, event, heartbeat_recv)
 
             elif event in ("end", "finish", "close"):
-                logger.info("ASL WebSocket session ended by client")
+                logger.info("[%s] RX %s -> closing session", conn_id, event)
                 break
 
             else:
-                logger.debug("ASL WS: unknown event '%s'", event)
+                logger.info("[%s] RX unknown_event=%s", conn_id, event)
 
     except Exception as e:
-        logger.exception("Exception in ASL WebSocket handler: %s", e)
+        logger.exception("[%s] EXCEPTION in ASL WebSocket handler: %s", conn_id, e)
     finally:
-        logger.info("ASL WebSocket connection closed. frames=%s messages=%s", frame_count, msg_count)
+        elapsed = time.time() - conn_started_at
+        logger.info(
+            "[%s] CLOSE elapsed=%.1fs messages=%s frames=%s infer_windows=%s predictions=%s decode_failures=%s heartbeats_tx=%s heartbeats_rx=%s",
+            conn_id,
+            elapsed,
+            msg_count,
+            frame_count,
+            infer_windows,
+            predictions_sent,
+            decode_failures,
+            heartbeat_sent,
+            heartbeat_recv,
+        )
 
 
 @sock.route("/speech/ws")
