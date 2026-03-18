@@ -8,7 +8,7 @@ from typing import Optional
 import traceback
 
 from dotenv import load_dotenv
-from flask import Flask, jsonify, request
+from flask import Flask, jsonify, request, send_file
 from flask_sock import Sock
 import logging
 import sys
@@ -16,7 +16,7 @@ import sys
 from firebase.db import FirestoreDB
 from speech.chirp_stream import ChirpStreamer, speaker_label_from_result
 
-from asl.asl_inference import transcribe_video
+from asl.asl_inference import transcribe_video, get_predictor
 
 load_dotenv()
 
@@ -98,6 +98,13 @@ def health():
     return jsonify({"status": "server running but no credentials"}), 500
 
 
+@app.route("/asl/test", methods=["GET"], strict_slashes=False)
+@app.get("/test_asl.html")
+def asl_test_page():
+    """Serve the ASL browser test page from this Flask app."""
+    return send_file("test_asl.html")
+
+
 @app.get("/ws-info")
 def ws_info():
     """
@@ -119,6 +126,16 @@ def ws_info():
         "ws_speech_url": f"{ws_scheme}://{host}/speech/ws",
         "request_host": request.host,
         "is_secure": request.is_secure,
+    })
+
+@app.get("/ws-hello")
+def ws_hello():
+    """
+    Just testing if jsonify or if this app.py works
+    """
+    print("Hello World")
+    return jsonify({
+        "hello" : "hi"
     })
 
 
@@ -286,6 +303,120 @@ def asl_transcribe():
         pass
 
     return jsonify({"text": text})
+
+
+@sock.route("/asl/ws")
+def asl_ws(ws):
+    """
+    WebSocket endpoint for real-time ASL sign-language translation.
+
+    The client streams JPEG frames (as base64 JSON or raw binary) at ~15fps.
+    The server runs MediaPipe hand-landmark extraction and LSTM inference,
+    then sends back predicted words as JSON messages.
+
+    Expected messages from client (JSON):
+        - {"event": "asl_frame", "frame": "<base64 JPEG>"}
+        - {"event": "reset"}        — clear frame buffer
+        - {"event": "end"}          — close the session
+
+    Server responses (JSON):
+        - {"event": "asl_result", "word": "hello"}
+        - {"event": "connected"}
+        - {"event": "error", "message": "..."}
+    """
+    logger.info("ASL WebSocket connection opened. remote=%s", request.remote_addr)
+    print(f"[ASL-WS] connection opened remote={request.remote_addr}", flush=True)
+
+    try:
+        predictor = get_predictor()
+    except Exception as e:
+        logger.exception("Failed to load ASL predictor: %s", e)
+        ws.send(json.dumps({"event": "error", "message": "Model failed to load"}))
+        return
+
+    # Each connection gets its own buffer state — share model, isolate buffers.
+    from asl.predictor import SEQUENCE_LENGTH, STRIDE, CONFIDENCE
+    from collections import deque
+    import numpy as np
+
+    frame_buffer = deque(maxlen=SEQUENCE_LENGTH)
+    frame_count = 0
+
+    ws.send(json.dumps({"event": "connected"}))
+    print("[ASL-WS] sent connected event", flush=True)
+
+    try:
+        while True:
+            msg = ws.receive()
+            if msg is None:
+                logger.info("ASL WebSocket client disconnected")
+                print("[ASL-WS] client disconnected (msg=None)", flush=True)
+                break
+
+            try:
+                data = json.loads(msg)
+            except Exception:
+                logger.debug("ASL WS: non-JSON message (len=%d)", len(msg) if msg else 0)
+                continue
+
+            event = data.get("event")
+
+            if event == "asl_frame":
+                if frame_count % 15 == 0:
+                    print(f"[ASL-WS] received asl_frame frame_count={frame_count}", flush=True)
+                frame_b64 = data.get("frame")
+                if not frame_b64:
+                    print("[ASL-WS] asl_frame missing frame payload", flush=True)
+                    continue
+
+                frame_bytes = base64.b64decode(frame_b64)
+                np_arr = np.frombuffer(frame_bytes, np.uint8)
+                import cv2
+                frame = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
+                if frame is None:
+                    print("[ASL-WS] cv2.imdecode returned None", flush=True)
+                    continue
+
+                keypoints = predictor._extract_keypoints(frame)
+                frame_buffer.append(keypoints)
+                frame_count += 1
+
+                if (len(frame_buffer) == SEQUENCE_LENGTH
+                        and frame_count % STRIDE == 0):
+                    seq = np.expand_dims(np.array(frame_buffer), axis=0)
+                    probs = predictor.model.predict(seq, verbose=0)[0]
+                    best = int(np.argmax(probs))
+                    conf = float(probs[best])
+                    if conf >= CONFIDENCE:
+                        word = predictor.labels.get(best, f"unknown_{best}")
+                        logger.info("ASL prediction: %s (%.2f)", word, conf)
+                        print(f"[ASL-WS] emitted asl_result word={word} conf={conf:.3f}", flush=True)
+                        ws.send(json.dumps({
+                            "event": "asl_result",
+                            "word": word,
+                            "confidence": round(conf, 3),
+                        }))
+
+            elif event == "reset":
+                frame_buffer.clear()
+                frame_count = 0
+                logger.info("ASL frame buffer reset")
+                print("[ASL-WS] reset received", flush=True)
+
+            elif event in ("end", "finish", "close"):
+                logger.info("ASL WebSocket session ended by client")
+                print(f"[ASL-WS] {event} received", flush=True)
+                break
+
+            else:
+                logger.debug("ASL WS: unknown event '%s'", event)
+                print(f"[ASL-WS] unknown event={event}", flush=True)
+
+    except Exception:
+        logger.exception("Exception in ASL WebSocket handler")
+    finally:
+        logger.info("ASL WebSocket connection closed")
+        print("[ASL-WS] connection closed", flush=True)
 
 
 @sock.route("/speech/ws")
