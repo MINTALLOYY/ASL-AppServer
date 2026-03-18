@@ -91,8 +91,6 @@ def health():
     except Exception:
         remote = None
     logger.info("Health check requested. remote=%s, creds_present=%s", remote, bool(creds))
-    # Ensure at least one unbuffered output for quick terminal verification
-    print(f"Health check requested. remote={remote}, creds_present={bool(creds)}", flush=True)
     if creds:
         return jsonify({"status": "ok and creds"})
     return jsonify({"status": "server running but no credentials"}), 500
@@ -133,7 +131,7 @@ def ws_hello():
     """
     Just testing if jsonify or if this app.py works
     """
-    print("Hello World")
+    logger.info("ws_hello endpoint hit")
     return jsonify({
         "hello" : "hi"
     })
@@ -325,7 +323,6 @@ def asl_ws(ws):
         - {"event": "error", "message": "..."}
     """
     logger.info("ASL WebSocket connection opened. remote=%s", request.remote_addr)
-    print(f"[ASL-WS] connection opened remote={request.remote_addr}", flush=True)
 
     try:
         predictor = get_predictor()
@@ -343,14 +340,13 @@ def asl_ws(ws):
     frame_count = 0
 
     ws.send(json.dumps({"event": "connected"}))
-    print("[ASL-WS] sent connected event", flush=True)
+    logger.info("ASL-WS sent connected event")
 
     try:
         while True:
             msg = ws.receive()
             if msg is None:
                 logger.info("ASL WebSocket client disconnected")
-                print("[ASL-WS] client disconnected (msg=None)", flush=True)
                 break
 
             try:
@@ -363,10 +359,10 @@ def asl_ws(ws):
 
             if event == "asl_frame":
                 if frame_count % 15 == 0:
-                    print(f"[ASL-WS] received asl_frame frame_count={frame_count}", flush=True)
+                    logger.info("ASL-WS received asl_frame frame_count=%s", frame_count)
                 frame_b64 = data.get("frame")
                 if not frame_b64:
-                    print("[ASL-WS] asl_frame missing frame payload", flush=True)
+                    logger.warning("ASL-WS asl_frame missing frame payload")
                     continue
 
                 frame_bytes = base64.b64decode(frame_b64)
@@ -374,7 +370,7 @@ def asl_ws(ws):
                 import cv2
                 frame = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
                 if frame is None:
-                    print("[ASL-WS] cv2.imdecode returned None", flush=True)
+                    logger.warning("ASL-WS cv2.imdecode returned None")
                     continue
 
                 keypoints = predictor._extract_keypoints(frame)
@@ -390,7 +386,7 @@ def asl_ws(ws):
                     if conf >= CONFIDENCE:
                         word = predictor.labels.get(best, f"unknown_{best}")
                         logger.info("ASL prediction: %s (%.2f)", word, conf)
-                        print(f"[ASL-WS] emitted asl_result word={word} conf={conf:.3f}", flush=True)
+                        logger.info("ASL-WS emitted asl_result word=%s conf=%.3f", word, conf)
                         ws.send(json.dumps({
                             "event": "asl_result",
                             "word": word,
@@ -401,22 +397,18 @@ def asl_ws(ws):
                 frame_buffer.clear()
                 frame_count = 0
                 logger.info("ASL frame buffer reset")
-                print("[ASL-WS] reset received", flush=True)
 
             elif event in ("end", "finish", "close"):
                 logger.info("ASL WebSocket session ended by client")
-                print(f"[ASL-WS] {event} received", flush=True)
                 break
 
             else:
                 logger.debug("ASL WS: unknown event '%s'", event)
-                print(f"[ASL-WS] unknown event={event}", flush=True)
 
     except Exception:
         logger.exception("Exception in ASL WebSocket handler")
     finally:
         logger.info("ASL WebSocket connection closed")
-        print("[ASL-WS] connection closed", flush=True)
 
 
 @sock.route("/speech/ws")
