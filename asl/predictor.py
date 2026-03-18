@@ -8,7 +8,6 @@ import platform
 import tempfile
 import threading
 import urllib.request
-from tensorflow.keras.models import load_model
 from collections import deque
 import logging
 
@@ -18,11 +17,24 @@ SEQUENCE_LENGTH = 30   # frames per inference window
 STRIDE          = 15   # run inference every N frames
 CONFIDENCE      = 0.85  # min confidence to emit a prediction
 
+# Canonical 21-point hand landmark connection graph.
+HAND_CONNECTIONS = [
+    [0, 1], [1, 2], [2, 3], [3, 4],
+    [0, 5], [5, 6], [6, 7], [7, 8],
+    [5, 9], [9, 10], [10, 11], [11, 12],
+    [9, 13], [13, 14], [14, 15], [15, 16],
+    [13, 17], [17, 18], [18, 19], [19, 20],
+    [0, 17],
+]
+
 
 class ASLPredictor:
     def __init__(self, model_path: str, labels_path: str):
+        from tensorflow.keras.models import load_model
+
         logger.info("Loading ASL model from %s", model_path)
-        self.model = load_model(model_path)
+        # Inference-only server path: avoid optimizer state allocation.
+        self.model = load_model(model_path, compile=False)
         logger.info("ASL model loaded. Input shape: %s", self.model.input_shape)
         # Supports (batch, seq, features), usually features=126 (hands) or 225 (pose+hands)
         self.feature_dim = int(self.model.input_shape[-1])
@@ -97,11 +109,17 @@ class ASLPredictor:
             "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task",
         )
 
+        # Pose model is optional for low-memory deployments.
+        enable_pose = os.environ.get("ASL_ENABLE_POSE", "0").strip().lower() in {"1", "true", "yes"}
         pose_model_path = None
-        if self.feature_dim != 126:
+        if self.feature_dim != 126 and enable_pose:
             pose_model_path = self._ensure_task_model(
                 "pose_landmarker_lite.task",
                 "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task",
+            )
+        elif self.feature_dim != 126:
+            logger.info(
+                "Pose landmarker disabled (ASL_ENABLE_POSE!=1). Using zeroed pose features to reduce memory usage."
             )
 
         self._tasks_hand = mp_tasks_vision.HandLandmarker.create_from_options(
@@ -128,10 +146,15 @@ class ASLPredictor:
 
     def _extract_keypoints(self, frame_bgr: np.ndarray) -> np.ndarray:
         """Run MediaPipe on a BGR frame and return vector sized to model feature_dim."""
+        feats, _ = self.extract_features_and_debug(frame_bgr)
+        return feats
+
+    def extract_features_and_debug(self, frame_bgr: np.ndarray) -> tuple[np.ndarray, dict]:
+        """Return feature vector and optional normalized hand landmarks for debug overlays."""
         with self._infer_lock:
             rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
             if self._backend == "tasks":
-                return self._extract_keypoints_tasks(rgb)
+                return self._extract_keypoints_tasks_with_debug(rgb)
 
             results = self.holistic.process(rgb)
 
@@ -146,22 +169,42 @@ class ASLPredictor:
         lh = lm_array(results.left_hand_landmarks, 21)   # 63 values
         rh = lm_array(results.right_hand_landmarks, 21)   # 63 values
 
+        debug = {
+            "left": self._normalize_hand_landmarks(results.left_hand_landmarks),
+            "right": self._normalize_hand_landmarks(results.right_hand_landmarks),
+        }
+
+        feats = self._compose_features(pose, lh, rh)
+        return feats.astype(np.float32), debug
+
+    def _compose_features(self, pose: np.ndarray, lh: np.ndarray, rh: np.ndarray) -> np.ndarray:
+        """Compose pose/hand vectors to match the model feature dimension."""
+
         # Match training pipeline shape:
         # 126 -> hands only, 225 -> pose + hands, fallback -> pad/trim.
         if self.feature_dim == 126:
-            feats = np.concatenate([lh, rh])
-        elif self.feature_dim == 225:
-            feats = np.concatenate([pose, lh, rh])
-        else:
-            raw = np.concatenate([pose, lh, rh])
-            if raw.shape[0] >= self.feature_dim:
-                feats = raw[:self.feature_dim]
-            else:
-                feats = np.pad(raw, (0, self.feature_dim - raw.shape[0]), mode="constant")
+            return np.concatenate([lh, rh])
+        if self.feature_dim == 225:
+            return np.concatenate([pose, lh, rh])
 
-        return feats.astype(np.float32)
+        raw = np.concatenate([pose, lh, rh])
+        if raw.shape[0] >= self.feature_dim:
+            return raw[:self.feature_dim]
+        return np.pad(raw, (0, self.feature_dim - raw.shape[0]), mode="constant")
+
+    def _normalize_hand_landmarks(self, lm_list) -> list[list[float]]:
+        if not lm_list:
+            return []
+        points = []
+        for lm in lm_list.landmark:
+            points.append([float(lm.x), float(lm.y)])
+        return points
 
     def _extract_keypoints_tasks(self, frame_rgb: np.ndarray) -> np.ndarray:
+        feats, _ = self._extract_keypoints_tasks_with_debug(frame_rgb)
+        return feats
+
+    def _extract_keypoints_tasks_with_debug(self, frame_rgb: np.ndarray) -> tuple[np.ndarray, dict]:
         image = self._tasks_image_cls(
             image_format=self._tasks_image_format,
             data=frame_rgb,
@@ -171,8 +214,12 @@ class ASLPredictor:
         lh = np.zeros(63, dtype=np.float32)
         rh = np.zeros(63, dtype=np.float32)
 
+        left_pts: list[list[float]] = []
+        right_pts: list[list[float]] = []
+
         for idx, landmarks in enumerate(hand_result.hand_landmarks):
             coords = np.array([[lm.x, lm.y, lm.z] for lm in landmarks], dtype=np.float32).flatten()
+            points_2d = [[float(lm.x), float(lm.y)] for lm in landmarks]
             hand_name = ""
             try:
                 classes = hand_result.handedness[idx]
@@ -183,12 +230,16 @@ class ASLPredictor:
 
             if hand_name == "left":
                 lh = coords
+                left_pts = points_2d
             elif hand_name == "right":
                 rh = coords
+                right_pts = points_2d
             elif not np.any(lh):
                 lh = coords
+                left_pts = points_2d
             elif not np.any(rh):
                 rh = coords
+                right_pts = points_2d
 
         pose = np.zeros(99, dtype=np.float32)
         if self._tasks_pose is not None:
@@ -203,18 +254,12 @@ class ASLPredictor:
                 elif pose.shape[0] > 99:
                     pose = pose[:99]
 
-        if self.feature_dim == 126:
-            feats = np.concatenate([lh, rh])
-        elif self.feature_dim == 225:
-            feats = np.concatenate([pose, lh, rh])
-        else:
-            raw = np.concatenate([pose, lh, rh])
-            if raw.shape[0] >= self.feature_dim:
-                feats = raw[:self.feature_dim]
-            else:
-                feats = np.pad(raw, (0, self.feature_dim - raw.shape[0]), mode="constant")
-
-        return feats.astype(np.float32)
+        feats = self._compose_features(pose, lh, rh)
+        debug = {
+            "left": left_pts,
+            "right": right_pts,
+        }
+        return feats.astype(np.float32), debug
 
     def process_frame(self, frame_bytes: bytes) -> str | None:
         """

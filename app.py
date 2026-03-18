@@ -101,12 +101,15 @@ def health():
 def asl_diagnostics():
     """
     Quick readiness endpoint for ASL model + MediaPipe compatibility.
+    Use ?load_predictor=1 to force model initialization.
     """
     info = {
         "python_version": platform.python_version(),
         "model_path": os.path.join(os.path.dirname(__file__), "asl", "asl_model.keras"),
         "labels_path": os.path.join(os.path.dirname(__file__), "asl", "label_map.json"),
     }
+    load_predictor = (request.args.get("load_predictor") or "").strip().lower() in {"1", "true", "yes"}
+    info["predictor_load_requested"] = load_predictor
     try:
         import mediapipe as mp
 
@@ -114,6 +117,11 @@ def asl_diagnostics():
         info["mediapipe_has_solutions"] = hasattr(mp, "solutions")
     except Exception as e:
         info["mediapipe_import_error"] = str(e)
+
+    if not load_predictor:
+        info["predictor_loaded"] = False
+        info["predictor_status"] = "skipped (set load_predictor=1 to initialize model)"
+        return jsonify(info)
 
     try:
         predictor = get_predictor()
@@ -375,9 +383,12 @@ def asl_ws(ws):
         return
 
     # Each connection gets its own buffer state — share model, isolate buffers.
-    from asl.predictor import SEQUENCE_LENGTH, STRIDE, CONFIDENCE
+    from asl.predictor import SEQUENCE_LENGTH, STRIDE, CONFIDENCE, HAND_CONNECTIONS
     from collections import deque
     import numpy as np
+
+    debug_landmarks = (request.args.get("debug") or "").strip().lower() in {"1", "true", "yes"}
+    debug_landmark_interval = 3
 
     frame_buffer = deque(maxlen=SEQUENCE_LENGTH)
     frame_count = 0
@@ -392,6 +403,7 @@ def asl_ws(ws):
     predictions_sent = 0
     heartbeat_sent = 0
     heartbeat_recv = 0
+    zero_keypoint_streak = 0
 
     ws.send(json.dumps({"event": "connected"}))
     logger.info("[%s] TX connected", conn_id)
@@ -468,18 +480,44 @@ def asl_ws(ws):
                     )
                     continue
 
-                keypoints = predictor._extract_keypoints(frame)
+                if debug_landmarks:
+                    keypoints, hand_debug = predictor.extract_features_and_debug(frame)
+                else:
+                    keypoints = predictor._extract_keypoints(frame)
+                    hand_debug = None
+
                 last_frame_at = time.time()
                 frame_buffer.append(keypoints)
                 frame_count += 1
+
+                if debug_landmarks and frame_count % debug_landmark_interval == 0:
+                    ws.send(json.dumps({
+                        "event": "asl_debug_landmarks",
+                        "frame": frame_count,
+                        "hands": hand_debug,
+                        "connections": HAND_CONNECTIONS,
+                    }))
+
+                nonzero_keypoints = int(np.count_nonzero(keypoints))
+                if nonzero_keypoints == 0:
+                    zero_keypoint_streak += 1
+                else:
+                    zero_keypoint_streak = 0
 
                 if frame_count % 10 == 0:
                     logger.info(
                         "[%s] KEYPOINTS frame=%s nonzero=%s feature_dim=%s",
                         conn_id,
                         frame_count,
-                        int(np.count_nonzero(keypoints)),
+                        nonzero_keypoints,
                         len(keypoints),
+                    )
+
+                if zero_keypoint_streak in (30, 60) or (zero_keypoint_streak > 0 and zero_keypoint_streak % 120 == 0):
+                    logger.warning(
+                        "[%s] NO_HANDS streak=%s frames. MediaPipe sees no landmarks; check camera angle, lighting, and hand visibility.",
+                        conn_id,
+                        zero_keypoint_streak,
                     )
 
                 if (len(frame_buffer) == SEQUENCE_LENGTH
@@ -488,6 +526,23 @@ def asl_ws(ws):
                     seq = np.expand_dims(np.array(frame_buffer), axis=0)
                     with predictor._infer_lock:
                         probs = predictor.model.predict(seq, verbose=0)[0]
+
+                    # Guard against NaN/Inf outputs from edge-case inputs.
+                    if not np.isfinite(probs).all():
+                        logger.warning(
+                            "[%s] INFER invalid_probs nan=%s posinf=%s neginf=%s -> sanitizing",
+                            conn_id,
+                            int(np.isnan(probs).sum()),
+                            int(np.isposinf(probs).sum()),
+                            int(np.isneginf(probs).sum()),
+                        )
+                        probs = np.nan_to_num(probs, nan=0.0, posinf=1.0, neginf=0.0)
+
+                    total_prob = float(np.sum(probs))
+                    if total_prob <= 0.0:
+                        logger.warning("[%s] INFER skipped: probability vector sums to 0.0", conn_id)
+                        continue
+
                     best = int(np.argmax(probs))
                     conf = float(probs[best])
                     best_word = predictor.labels.get(best, f"unknown_{best}")
