@@ -52,7 +52,25 @@ logger.info(
 app = Flask(__name__)
 sock = Sock(app)
 
-FIREBASE_PROJECT_ID = os.environ.get("FIREBASE_PROJECT_ID")
+creds = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS")
+creds_project_id = None
+if creds and creds.strip().startswith("{"):
+    try:
+        creds_obj = json.loads(creds)
+        creds_project_id = creds_obj.get("project_id")
+        tmp_json = os.path.join(tempfile.gettempdir(), "gcp_creds.json")
+        with open(tmp_json, "w") as f:
+            f.write(creds)
+        os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = tmp_json
+    except Exception:
+        pass
+
+FIREBASE_PROJECT_ID = (
+    os.environ.get("FIREBASE_PROJECT_ID")
+    or os.environ.get("GOOGLE_CLOUD_PROJECT")
+    or os.environ.get("GCLOUD_PROJECT")
+    or creds_project_id
+)
 try:
     db = FirestoreDB(project_id=FIREBASE_PROJECT_ID or None)
     logger.info("Firestore initialized successfully. project_id=%s", FIREBASE_PROJECT_ID)
@@ -74,16 +92,6 @@ session_modes: dict[str, str] = {}
 # Keys: conversation_id, Values: set of labels (e.g. {'Speaker_1', 'Speaker_2'})
 identified_labels: dict[str, set] = {}
 
-creds = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS")
-if creds and creds.strip().startswith("{"):
-    try:
-        tmp_json = os.path.join(tempfile.gettempdir(), "gcp_creds.json")
-        with open(tmp_json, "w") as f:
-            f.write(creds)
-        os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = tmp_json
-    except Exception:
-        pass
-
 
 @app.get("/health")
 def health():
@@ -99,7 +107,11 @@ def health():
         remote = None
     logger.info("Health check requested. remote=%s, creds_present=%s", remote, bool(creds))
     if creds:
-        return jsonify({"status": "ok and creds"})
+        return jsonify({
+            "status": "ok and creds",
+            "firestore_project_id": FIREBASE_PROJECT_ID,
+            "db_available": bool(db),
+        })
     return jsonify({"status": "server running but no credentials"}), 500
 
 

@@ -7,9 +7,6 @@ class TestChirpStreamer(unittest.TestCase):
 
     @patch("google.cloud.speech_v1.SpeechClient")
     def test_request_generator(self, MockSpeechClient):
-        # Mock the SpeechClient
-        mock_client = MockSpeechClient.return_value
-
         # Initialize ChirpStreamer
         streamer = ChirpStreamer(language_code="en-US", sample_rate_hz=16000, diarization_speaker_count=2)
 
@@ -21,16 +18,10 @@ class TestChirpStreamer(unittest.TestCase):
         # Get the generator
         generator = streamer._request_generator()
 
-        # First request should contain the streaming config
+        # Request should contain audio data
         first_request = next(generator)
         self.assertIsInstance(first_request, speech.StreamingRecognizeRequest)
-        self.assertIsNotNone(first_request.streaming_config)
-        self.assertIsInstance(first_request.streaming_config, speech.StreamingRecognitionConfig)
-
-        # Second request should contain audio data
-        second_request = next(generator)
-        self.assertIsInstance(second_request, speech.StreamingRecognizeRequest)
-        self.assertEqual(second_request.audio_content, audio_data)
+        self.assertEqual(first_request.audio_content, audio_data)
 
     @patch("google.cloud.speech_v1.SpeechClient")
     def test_responses(self, MockSpeechClient):
@@ -48,7 +39,12 @@ class TestChirpStreamer(unittest.TestCase):
         # Call responses and check the result
         responses = streamer.responses()
         self.assertEqual(list(responses), [mock_response])
-        mock_client.streaming_recognize.assert_called_once_with(requests=streamer._request_generator())
+        mock_client.streaming_recognize.assert_called_once()
+        call_args, call_kwargs = mock_client.streaming_recognize.call_args
+        self.assertEqual(len(call_args), 2)
+        self.assertIsInstance(call_args[0], speech.StreamingRecognitionConfig)
+        self.assertIs(call_args[1], streamer._request_generator())
+        self.assertEqual(call_kwargs, {})
 
 if __name__ == "__main__":
     unittest.main()
