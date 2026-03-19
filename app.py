@@ -101,7 +101,7 @@ def health():
 def asl_diagnostics():
     """
     Quick readiness endpoint for ASL model + MediaPipe compatibility.
-    Use ?load_predictor=1 to force model initialization.
+    Loads predictor by default. Use ?load_predictor=0 to skip model initialization.
     """
     py_version = platform.python_version()
     info = {
@@ -116,7 +116,11 @@ def asl_diagnostics():
         info["python_compatible"] = (major, minor) <= (3, 11)
     except Exception:
         info["python_compatible"] = None
-    load_predictor = (request.args.get("load_predictor") or "").strip().lower() in {"1", "true", "yes"}
+    load_predictor_arg = request.args.get("load_predictor")
+    if load_predictor_arg is None:
+        load_predictor = True
+    else:
+        load_predictor = load_predictor_arg.strip().lower() not in {"0", "false", "no"}
     info["predictor_load_requested"] = load_predictor
     try:
         import mediapipe as mp
