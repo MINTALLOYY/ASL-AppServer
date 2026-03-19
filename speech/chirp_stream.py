@@ -25,7 +25,7 @@ class ChirpStreamer:
         language_code: str = "en-US",
         sample_rate_hz: int = 16000,
         diarization_speaker_count: int = 2,
-        audio_queue_maxsize: int = 256,
+        audio_queue_maxsize: int = 512,
     ) -> None:
         self.language_code = language_code
         self.sample_rate_hz = sample_rate_hz
@@ -54,10 +54,22 @@ class ChirpStreamer:
                 self._audio_q.put(decoded, block=False)
             except queue.Full:
                 self._dropped_chunks += 1
+                cleared = 0
+                while True:
+                    try:
+                        self._audio_q.get_nowait()
+                        cleared += 1
+                    except queue.Empty:
+                        break
+                try:
+                    self._audio_q.put(decoded, block=False)
+                except queue.Full:
+                    pass
                 if self._dropped_chunks <= 3 or self._dropped_chunks % 25 == 0:
                     logger.warning(
-                        "Audio queue full (maxsize=%s). Dropping chunk #%s (size=%s bytes)",
+                        "Audio queue full (maxsize=%s). Cleared %s queued chunks; replaced with newest chunk #%s (size=%s bytes)",
                         self.audio_queue_maxsize,
+                        cleared,
                         self._dropped_chunks,
                         len(decoded),
                     )
