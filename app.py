@@ -52,9 +52,15 @@ logger.info(
 app = Flask(__name__)
 sock = Sock(app)
 
-# FIREBASE_PROJECT_ID = os.environ.get("FIREBASE_PROJECT_ID")
-# db = FirestoreDB(project_id=FIREBASE_PROJECT_ID)
-db = False
+FIREBASE_PROJECT_ID = os.environ.get("FIREBASE_PROJECT_ID")
+try:
+    db = FirestoreDB(project_id=FIREBASE_PROJECT_ID or None)
+    logger.info("Firestore initialized successfully. project_id=%s", FIREBASE_PROJECT_ID)
+except Exception as _db_init_err:
+    logger.warning(
+        "Firestore initialization failed — db features disabled: %s", _db_init_err
+    )
+    db = None
 
 # In-memory speaker registration store (MVP – not persisted across restarts).
 # Keys: conversation_id, Values: dict mapping diarization label to participant name.
@@ -213,6 +219,107 @@ def ws_echo(ws):
         logger.info("WebSocket ECHO connection closed")
 
 
+@app.post("/conversations")
+def conversations_create():
+    """
+    Create a new captioning conversation.
+
+    Optional JSON payload:
+        {"conversation_id": "my-custom-id"}
+
+    If conversation_id is omitted Firestore auto-generates one.
+
+    Returns:
+        JSON: {"conversation_id": "...", "status": "active"}  HTTP 201
+        Error 503 if Firestore is unavailable.
+        Error 500 on unexpected errors.
+    """
+    if not db:
+        return jsonify({"error": "Database not available"}), 503
+    data = request.get_json(silent=True) or {}
+    conversation_id = data.get("conversation_id") or None
+    try:
+        cid = db.create_conversation(conversation_id=conversation_id)
+        return jsonify({"conversation_id": cid, "status": "active"}), 201
+    except Exception as e:
+        logger.exception("conversations_create error: %s", e)
+        return jsonify({"error": str(e)}), 500
+
+
+@app.get("/conversations")
+def conversations_list():
+    """
+    List captioning conversations, most recently updated first.
+
+    Query parameters:
+        - limit (optional, default 50, max 100): number of conversations to return.
+
+    Returns:
+        JSON: {"conversations": [...]}
+        Error 503 if Firestore is unavailable.
+    """
+    if not db:
+        return jsonify({"error": "Database not available"}), 503
+    try:
+        limit = int(request.args.get("limit", 50))
+    except (TypeError, ValueError):
+        limit = 50
+    try:
+        convs = db.list_conversations(limit=limit)
+        return jsonify({"conversations": convs})
+    except Exception as e:
+        logger.exception("conversations_list error: %s", e)
+        return jsonify({"error": str(e)}), 500
+
+
+@app.get("/conversations/<conversation_id>")
+def conversations_get(conversation_id):
+    """
+    Retrieve a conversation and all of its messages in chronological order.
+
+    Path parameters:
+        - conversation_id: Firestore document ID.
+
+    Returns:
+        JSON: {conversation metadata} + "messages": [...]
+        Error 404 if the conversation does not exist.
+        Error 503 if Firestore is unavailable.
+    """
+    if not db:
+        return jsonify({"error": "Database not available"}), 503
+    try:
+        conv = db.get_conversation(conversation_id)
+        if conv is None:
+            return jsonify({"error": "Conversation not found"}), 404
+        conv["messages"] = db.get_messages(conversation_id)
+        return jsonify(conv)
+    except Exception as e:
+        logger.exception("conversations_get error: %s", e)
+        return jsonify({"error": str(e)}), 500
+
+
+@app.get("/conversations/<conversation_id>/messages")
+def conversations_messages(conversation_id):
+    """
+    Retrieve messages for a conversation in chronological order.
+
+    Path parameters:
+        - conversation_id: Firestore document ID.
+
+    Returns:
+        JSON: {"conversation_id": "...", "messages": [...]}
+        Error 503 if Firestore is unavailable.
+    """
+    if not db:
+        return jsonify({"error": "Database not available"}), 503
+    try:
+        messages = db.get_messages(conversation_id)
+        return jsonify({"conversation_id": conversation_id, "messages": messages})
+    except Exception as e:
+        logger.exception("conversations_messages error: %s", e)
+        return jsonify({"error": str(e)}), 500
+
+
 @app.post("/speech/finalize")
 def speech_finalize():
     """
@@ -367,20 +474,25 @@ def asl_ws(ws):
     The server runs MediaPipe hand-landmark extraction and LSTM inference,
     then sends back predicted words as JSON messages.
 
+    Query parameters:
+        - conversation_id (optional): Firestore conversation ID to persist ASL results.
+        - debug (optional): set to 1 to receive hand-landmark overlays.
+
     Expected messages from client (JSON):
         - {"event": "asl_frame", "frame": "<base64 JPEG>"}
         - {"event": "reset"}        — clear frame buffer
         - {"event": "end"}          — close the session
 
     Server responses (JSON):
-        - {"event": "asl_result", "word": "hello"}
+        - {"event": "asl_result", "word": "hello", "confidence": 0.92}
         - {"event": "connected"}
         - {"event": "error", "message": "..."}
     """
     conn_started_at = time.time()
     conn_id = f"aslws-{int(conn_started_at * 1000)}-{(id(ws) % 100000)}"
     remote = request.remote_addr
-    logger.info("[%s] OPEN remote=%s path=/asl/ws", conn_id, remote)
+    conversation_id: Optional[str] = request.args.get("conversation_id")
+    logger.info("[%s] OPEN remote=%s path=/asl/ws conversation_id=%s", conn_id, remote, conversation_id)
 
     # Ack immediately so clients are not stuck waiting while model loads.
     ws.send(json.dumps({"event": "connected"}))
@@ -610,6 +722,16 @@ def asl_ws(ws):
                             "word": word,
                             "confidence": round(conf, 3),
                         }))
+                        # Persist to Firestore if a conversation is linked
+                        try:
+                            if conversation_id and db:
+                                db.save_message(
+                                    conversation_id=conversation_id,
+                                    text=word,
+                                    source="asl",
+                                )
+                        except Exception as _db_err:
+                            logger.error("[%s] Firestore save error (asl_result): %s", conn_id, _db_err)
                     else:
                         logger.info("[%s] INFER below_threshold conf=%.3f", conn_id, conf)
 
