@@ -49,7 +49,7 @@ class FirestoreDB:
 
     # ── write operations ──────────────────────────────────────────────────────
 
-    def create_conversation(self, conversation_id: Optional[str] = None) -> str:
+    def create_conversation(self, conversation_id: Optional[str] = None, user_id: Optional[str] = None) -> str:
         """
         Create a new conversation document and return its ID.
 
@@ -65,17 +65,25 @@ class FirestoreDB:
         else:
             conv_ref = self.client.collection("conversations").document()
 
-        conv_ref.set(
-            {
-                "status": "active",
-                "created_at": firestore.SERVER_TIMESTAMP,
-                "updated_at": firestore.SERVER_TIMESTAMP,
-            },
-            merge=True,
-        )
+        payload = {
+            "status": "active",
+            "created_at": firestore.SERVER_TIMESTAMP,
+            "updated_at": firestore.SERVER_TIMESTAMP,
+        }
+        if user_id:
+            payload["user_id"] = user_id
+
+        conv_ref.set(payload, merge=True)
         return conv_ref.id
 
-    def save_message(self, conversation_id: str, text: str, source: str, speaker: Optional[str] = None):
+    def save_message(
+        self,
+        conversation_id: str,
+        text: str,
+        source: str,
+        speaker: Optional[str] = None,
+        user_id: Optional[str] = None,
+    ):
         """
         Save a transcript message to Firestore under a conversation.
 
@@ -92,14 +100,14 @@ class FirestoreDB:
             return
         conv_ref = self.client.collection("conversations").document(conversation_id)
         # Initialize status/created_at on first message; always bump updated_at.
-        conv_ref.set(
-            {
-                "status": "active",
-                "created_at": firestore.SERVER_TIMESTAMP,
-                "updated_at": firestore.SERVER_TIMESTAMP,
-            },
-            merge=True,
-        )
+        payload = {
+            "status": "active",
+            "created_at": firestore.SERVER_TIMESTAMP,
+            "updated_at": firestore.SERVER_TIMESTAMP,
+        }
+        if user_id:
+            payload["user_id"] = user_id
+        conv_ref.set(payload, merge=True)
         msg_ref = conv_ref.collection("messages").document()
         payload = {
             "text": text,
@@ -197,7 +205,7 @@ class FirestoreDB:
             result.append(data)
         return result
 
-    def list_conversations(self, limit: int = 50) -> list:
+    def list_conversations(self, limit: int = 50, user_id: Optional[str] = None) -> list:
         """
         List conversations ordered by most-recently-updated first.
 
@@ -208,11 +216,11 @@ class FirestoreDB:
             List of conversation dicts, each with a "conversation_id" field.
         """
         limit = min(limit, 100)
-        query = (
-            self.client.collection("conversations")
-            .order_by("updated_at", direction=firestore.Query.DESCENDING)
-            .limit(limit)
-        )
+        query = self.client.collection("conversations")
+        if user_id:
+            # Requires composite index in Firestore: user_id ASC, updated_at DESC.
+            query = query.where("user_id", "==", user_id)
+        query = query.order_by("updated_at", direction=firestore.Query.DESCENDING).limit(limit)
         result = []
         for doc in query.stream():
             data = self._serialize(doc.to_dict() or {})
