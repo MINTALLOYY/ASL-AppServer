@@ -803,6 +803,23 @@ def speech_ws(ws):
     
     Audio format: base64-encoded 16 kHz, 16-bit mono PCM (LINEAR16).
     """
+    def _safe_ws_send(payload: dict, context: str) -> bool:
+        try:
+            serialized = json.dumps(payload)
+            ws.send(serialized)
+            logger.info(
+                "WS->client sent context=%s event=%s bytes=%s conversation_id=%s",
+                context,
+                payload.get("event"),
+                len(serialized),
+                conversation_id,
+            )
+            return True
+        except Exception as send_err:
+            logger.error("WebSocket send error context=%s err=%s payload=%s", context, send_err, payload)
+            logger.error(traceback.format_exc())
+            return False
+
     # Get conversation_id from query params (optional)
     conversation_id: Optional[str] = request.args.get("conversation_id")
     # Mode state machine: 'identifying' or 'captioning'
@@ -824,8 +841,8 @@ def speech_ws(ws):
     except Exception:
         remote = None
     logger.info(
-        "WebSocket connection opened. conversation_id=%s, remote=%s, mode=%s, num_speakers=%s",
-        conversation_id, remote, initial_mode, num_speakers,
+        "WebSocket connection opened. conversation_id=%s remote=%s mode=%s num_speakers=%s query=%s",
+        conversation_id, remote, initial_mode, num_speakers, dict(request.args),
     )
 
     # Background thread: consume responses from Google Speech and send to client
@@ -840,8 +857,40 @@ def speech_ws(ws):
                 except Exception:
                     results_len = "unknown"
                 if response_count <= 3 or response_count % 20 == 0 or results_len == 0:
-                    logger.info("Received response #%s. Results count: %s", response_count, results_len)
+                    logger.info(
+                        "Google response #%s results=%s streamer_stats=%s",
+                        response_count,
+                        results_len,
+                        streamer_state["streamer"].debug_stats(),
+                    )
+                if not response.results:
+                    logger.info(
+                        "Google response #%s had zero results. conversation_id=%s",
+                        response_count,
+                        conversation_id,
+                    )
                 for result in response.results:
+                    try:
+                        alt0 = result.alternatives[0] if result.alternatives else None
+                        alt0_text = ((alt0.transcript or "").strip() if alt0 else "")
+                        alt0_words = len(alt0.words) if alt0 and alt0.words else 0
+                        logger.info(
+                            "Google result detail: final=%s stability=%.3f alts=%s transcript_len=%s words=%s conversation_id=%s",
+                            result.is_final,
+                            float(getattr(result, "stability", 0.0) or 0.0),
+                            len(result.alternatives),
+                            len(alt0_text),
+                            alt0_words,
+                            conversation_id,
+                        )
+                    except Exception:
+                        logger.debug("Failed to log Google result detail")
+                    if not result.is_final:
+                        logger.info(
+                            "Ignoring non-final result because server uses final-only captions. conversation_id=%s",
+                            conversation_id,
+                        )
+                        continue
                     if result.is_final:
                         # ── Identifying mode: emit speaker_detected, skip transcript ──
                         current_mode = session_modes.get(conversation_id, "captioning") if conversation_id else "captioning"
@@ -869,10 +918,13 @@ def speech_ws(ws):
                                         if label not in seen:
                                             seen.add(label)
                                             identified_labels[conversation_id] = seen
-                                            ws.send(json.dumps({
+                                            sent_ok = _safe_ws_send({
                                                 "event": "speaker_detected",
                                                 "label": label,
-                                            }))
+                                            }, context="speaker_detected")
+                                            if not sent_ok:
+                                                streamer_state["streamer"].finish()
+                                                return
                                             logger.info(
                                                 "speaker_detected SENT: label=%s conversation_id=%s tag_counts=%s",
                                                 label, conversation_id, tag_counts,
@@ -887,6 +939,11 @@ def speech_ws(ws):
                                         "IDENTIFY result: no words in result. transcript='%s' conversation_id=%s",
                                         transcript, conversation_id,
                                     )
+                                    if not transcript:
+                                        logger.warning(
+                                            "IDENTIFY final result had empty transcript and no words. conversation_id=%s",
+                                            conversation_id,
+                                        )
                             except Exception as e:
                                 logger.error("Error in identifying mode: %s", e)
                             continue  # do NOT emit final_transcript during identification
@@ -896,23 +953,35 @@ def speech_ws(ws):
                             transcript = (alt.transcript or "").strip()
                         except Exception:
                             transcript = ""
+                            logger.warning(
+                                "CAPTION result had no alternatives or transcript extraction failed. conversation_id=%s",
+                                conversation_id,
+                            )
                         speaker = speaker_label_from_result(result)
                         # Log diarization details for debugging
                         try:
                             if alt.words:
                                 word_tags = [(w.word, int(getattr(w, "speaker_tag", 0) or 0)) for w in alt.words[-5:]]
                                 logger.info("CAPTION result: speaker=%s transcript='%s' last_word_tags=%s", speaker, transcript[:80], word_tags)
+                            else:
+                                logger.info(
+                                    "CAPTION final result has no word-level diarization tags. transcript_len=%s speaker=%s",
+                                    len(transcript),
+                                    speaker,
+                                )
                         except Exception:
                             pass
                         if transcript:
                             try:
-                                message = json.dumps({
+                                payload = {
                                     "event": "final_transcript",
                                     "text": transcript,
                                     "speaker": speaker
-                                })
-                                logger.debug("Sending message: %s", message)
-                                ws.send(message)
+                                }
+                                sent_ok = _safe_ws_send(payload, context="final_transcript")
+                                if not sent_ok:
+                                    streamer_state["streamer"].finish()
+                                    return
                             except Exception as e:
                                 logger.error("WebSocket send error: %s", e)
                                 logger.error(traceback.format_exc())
@@ -923,6 +992,12 @@ def speech_ws(ws):
                                     db.save_message(conversation_id=conversation_id, text=transcript, source="speech", speaker=speaker)
                             except Exception as e:
                                 logger.error("Firestore save error: %s", e)
+                        else:
+                            logger.warning(
+                                "CAPTION final result produced empty transcript; nothing sent to client. speaker=%s conversation_id=%s",
+                                speaker,
+                                conversation_id,
+                            )
             logger.debug("consume_responses finished. Total responses: %s", response_count)
         except Exception as e:
             logger.error("Error in consume_responses: %s", e)
@@ -930,6 +1005,7 @@ def speech_ws(ws):
             # If the stream errored due to audio timeout, mark inactive so we can restart on next audio
             if "Audio Timeout" in str(e) or "Audio Timeout Error" in str(e):
                 streamer_state["active"] = False
+                logger.warning("Speech stream marked inactive due to timeout. stats=%s", streamer_state["streamer"].debug_stats())
 
     # Start response consumer in background
     t = threading.Thread(target=consume_responses, daemon=True)
@@ -974,6 +1050,14 @@ def speech_ws(ws):
                 continue
 
             event = data.get("event")
+            if msg_count <= 5 or msg_count % 50 == 0:
+                logger.info(
+                    "RX websocket event=%s msg_count=%s keys=%s conversation_id=%s",
+                    event,
+                    msg_count,
+                    sorted(list(data.keys())),
+                    conversation_id,
+                )
             if event == "audio_chunk":
                 # Decode base64 audio and feed to streamer
                 b64 = data.get("data")
@@ -985,16 +1069,29 @@ def speech_ws(ws):
                 streamer_state["audio_chunk_count"] = audio_chunk_count
                 if audio_chunk_count <= 3 or audio_chunk_count % 25 == 0:
                     logger.info(
-                        "event=audio_chunk conversation_id=%s chunk_count=%s b64_len=%s streamer_active=%s",
+                        "event=audio_chunk conversation_id=%s chunk_count=%s b64_len=%s streamer_active=%s mode=%s",
                         conversation_id,
                         audio_chunk_count,
                         b64_len,
                         streamer_state["active"],
+                        session_modes.get(conversation_id, initial_mode) if conversation_id else initial_mode,
+                    )
+                if isinstance(b64, str) and (audio_chunk_count <= 3 or audio_chunk_count % 100 == 0):
+                    try:
+                        b64_preview = b64[:20]
+                    except Exception:
+                        b64_preview = "<preview-failed>"
+                    logger.info(
+                        "audio_chunk detail: chunk=%s b64_preview=%s conversation_field=%s",
+                        audio_chunk_count,
+                        b64_preview,
+                        data.get("conversation_id"),
                     )
                 if not conversation_id:
                     cid = data.get("conversation_id")
                     if cid:
                         conversation_id = cid
+                        logger.info("conversation_id adopted from audio_chunk payload: %s", conversation_id)
                 # If previous stream errored (timeout), restart a new stream and consumer
                 if not streamer_state["active"]:
                     logger.warning("Restarting speech stream due to previous timeout...")
@@ -1026,22 +1123,22 @@ def speech_ws(ws):
                 if conversation_id:
                     session_modes[conversation_id] = "captioning"
                     logger.info("Mode switched to captioning for conversation_id=%s", conversation_id)
-                ws.send(json.dumps({"event": "captioning_started"}))
+                _safe_ws_send({"event": "captioning_started"}, context="begin_captioning")
             elif event == "reset_identification":
                 # Clear seen labels so retries/re-identify work
                 if conversation_id:
                     identified_labels[conversation_id] = set()
                     logger.info("Reset identified_labels for conversation_id=%s", conversation_id)
-                ws.send(json.dumps({"event": "identification_reset"}))
+                _safe_ws_send({"event": "identification_reset"}, context="reset_identification")
             elif event == "set_conversation":
                 # Set or update conversation_id mid-session
                 cid = data.get("conversation_id")
                 if cid:
                     conversation_id = cid
-                    logger.debug("set_conversation updated conversation_id=%s", conversation_id)
+                    logger.info("set_conversation updated conversation_id=%s", conversation_id)
             else:
                 # Ignore unknown events
-                logger.debug("Unknown websocket event received: %s", event)
+                logger.info("Unknown websocket event received: %s payload=%s", event, data)
     except Exception:
         logger.exception("Exception in WebSocket main loop")
     finally:
@@ -1058,7 +1155,11 @@ def speech_ws(ws):
         if conversation_id:
             session_modes.pop(conversation_id, None)
             identified_labels.pop(conversation_id, None)
-        logger.debug("WebSocket handler cleanup complete for conversation_id=%s", conversation_id)
+        logger.info(
+            "WebSocket handler cleanup complete conversation_id=%s final_streamer_stats=%s",
+            conversation_id,
+            streamer_state["streamer"].debug_stats(),
+        )
 
 
 # Run the Flask app
