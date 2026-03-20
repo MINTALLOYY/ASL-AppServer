@@ -25,10 +25,14 @@ class TestConversationRoutes(unittest.TestCase):
         self.client = server_app.app.test_client()
         # Replace the module-level db with a fresh mock for each test.
         self.mock_db = _make_mock_db()
+        self.mock_db.get_conversation.return_value = None
         self._orig_db = server_app.db
         server_app.db = self.mock_db
+        self.auth_patcher = patch.object(server_app, "_require_request_user_id", return_value=("user-1", None))
+        self.auth_patcher.start()
 
     def tearDown(self):
+        self.auth_patcher.stop()
         server_app.db = self._orig_db
 
     # ── POST /conversations ────────────────────────────────────────────────
@@ -44,7 +48,7 @@ class TestConversationRoutes(unittest.TestCase):
         body = resp.get_json()
         self.assertEqual(body["conversation_id"], "auto-generated-id")
         self.assertEqual(body["status"], "active")
-        self.mock_db.create_conversation.assert_called_once_with(conversation_id=None)
+        self.mock_db.create_conversation.assert_called_once_with(conversation_id=None, user_id="user-1")
 
     def test_create_conversation_explicit_id(self):
         self.mock_db.create_conversation.return_value = "my-conv-123"
@@ -56,7 +60,7 @@ class TestConversationRoutes(unittest.TestCase):
         self.assertEqual(resp.status_code, 201)
         body = resp.get_json()
         self.assertEqual(body["conversation_id"], "my-conv-123")
-        self.mock_db.create_conversation.assert_called_once_with(conversation_id="my-conv-123")
+        self.mock_db.create_conversation.assert_called_once_with(conversation_id="my-conv-123", user_id="user-1")
 
     def test_create_conversation_db_error(self):
         self.mock_db.create_conversation.side_effect = RuntimeError("firestore down")
@@ -84,27 +88,27 @@ class TestConversationRoutes(unittest.TestCase):
         body = resp.get_json()
         self.assertIn("conversations", body)
         self.assertEqual(len(body["conversations"]), 1)
-        self.mock_db.list_conversations.assert_called_once_with(limit=50)
+        self.mock_db.list_conversations.assert_called_once_with(limit=50, user_id="user-1")
 
     def test_list_conversations_custom_limit(self):
         self.mock_db.list_conversations.return_value = []
         resp = self.client.get("/conversations?limit=10")
         self.assertEqual(resp.status_code, 200)
-        self.mock_db.list_conversations.assert_called_once_with(limit=10)
+        self.mock_db.list_conversations.assert_called_once_with(limit=10, user_id="user-1")
 
     def test_list_conversations_bad_limit_uses_default(self):
         self.mock_db.list_conversations.return_value = []
         resp = self.client.get("/conversations?limit=notanumber")
         self.assertEqual(resp.status_code, 200)
         # Bad value falls back to 50
-        self.mock_db.list_conversations.assert_called_once_with(limit=50)
+        self.mock_db.list_conversations.assert_called_once_with(limit=50, user_id="user-1")
 
     def test_list_conversations_limit_capped_at_100(self):
         self.mock_db.list_conversations.return_value = []
         resp = self.client.get("/conversations?limit=150")
         self.assertEqual(resp.status_code, 200)
         # Route passes the value through; the DB layer caps it at 100
-        self.mock_db.list_conversations.assert_called_once_with(limit=150)
+        self.mock_db.list_conversations.assert_called_once_with(limit=150, user_id="user-1")
 
     def test_list_conversations_db_unavailable(self):
         server_app.db = None
@@ -117,6 +121,7 @@ class TestConversationRoutes(unittest.TestCase):
         self.mock_db.get_conversation.return_value = {
             "conversation_id": "conv1",
             "status": "active",
+            "user_id": "user-1",
             "created_at": "2024-01-01T00:00:00",
         }
         self.mock_db.get_messages.return_value = [
@@ -151,6 +156,7 @@ class TestConversationRoutes(unittest.TestCase):
     # ── GET /conversations/<id>/messages ───────────────────────────────────
 
     def test_get_messages_returns_list(self):
+        self.mock_db.get_conversation.return_value = {"conversation_id": "conv2", "user_id": "user-1"}
         self.mock_db.get_messages.return_value = [
             {"id": "m1", "text": "hi", "type": "speech", "speaker": "Bob", "created_at": "2024-01-01T00:00:00"},
         ]
@@ -162,6 +168,7 @@ class TestConversationRoutes(unittest.TestCase):
         self.assertEqual(body["messages"][0]["text"], "hi")
 
     def test_get_messages_empty(self):
+        self.mock_db.get_conversation.return_value = {"conversation_id": "conv3", "user_id": "user-1"}
         self.mock_db.get_messages.return_value = []
         resp = self.client.get("/conversations/conv3/messages")
         self.assertEqual(resp.status_code, 200)
@@ -174,9 +181,37 @@ class TestConversationRoutes(unittest.TestCase):
         self.assertEqual(resp.status_code, 503)
 
     def test_get_messages_db_error(self):
+        self.mock_db.get_conversation.return_value = {"conversation_id": "conv4", "user_id": "user-1"}
         self.mock_db.get_messages.side_effect = RuntimeError("firestore error")
         resp = self.client.get("/conversations/conv4/messages")
         self.assertEqual(resp.status_code, 500)
+
+    def test_get_conversation_forbidden_user_hidden_as_not_found(self):
+        self.mock_db.get_conversation.return_value = {
+            "conversation_id": "conv1",
+            "status": "active",
+            "user_id": "other-user",
+        }
+        resp = self.client.get("/conversations/conv1")
+        self.assertEqual(resp.status_code, 404)
+
+    def test_get_messages_forbidden_user_hidden_as_not_found(self):
+        self.mock_db.get_conversation.return_value = {
+            "conversation_id": "conv9",
+            "status": "active",
+            "user_id": "other-user",
+        }
+        resp = self.client.get("/conversations/conv9/messages")
+        self.assertEqual(resp.status_code, 404)
+
+    def test_list_conversations_requires_auth(self):
+        with patch.object(
+            server_app,
+            "_require_request_user_id",
+            return_value=(None, ({"error": "Missing Authorization header"}, 401)),
+        ):
+            resp = self.client.get("/conversations")
+        self.assertEqual(resp.status_code, 401)
 
 
 class TestFirestoreDBMethods(unittest.TestCase):

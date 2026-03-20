@@ -3,6 +3,7 @@ Flask-Sock>=0.7.0
 google-cloud-speech>=2.21.0
 google-cloud-firestore>=2.23.0
 google-auth>=2.47.0
+firebase-admin>=6.6.0
 grpcio>=1.76.0
 grpcio-status>=1.76.0
 protobuf>=5.28.0,<7.0.0

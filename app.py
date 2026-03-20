@@ -13,6 +13,8 @@ from flask import Flask, jsonify, request, send_file
 from flask_sock import Sock
 import logging
 import sys
+import firebase_admin
+from firebase_admin import auth as firebase_auth
 
 from firebase.db import FirestoreDB
 from speech.chirp_stream import ChirpStreamer, speaker_label_from_result
@@ -79,6 +81,77 @@ except Exception as _db_init_err:
         "Firestore initialization failed — db features disabled: %s", _db_init_err
     )
     db = None
+
+try:
+    firebase_admin.get_app()
+except ValueError:
+    firebase_admin.initialize_app()
+except Exception as _firebase_init_err:
+    logger.warning("Firebase Admin initialization failed: %s", _firebase_init_err)
+
+
+def _extract_bearer_token() -> Optional[str]:
+    auth_header = request.headers.get("Authorization", "")
+    if not auth_header:
+        return None
+    if auth_header.startswith("Bearer "):
+        token = auth_header[7:].strip()
+        return token or None
+    return None
+
+
+def _verify_firebase_token(token: str) -> Optional[str]:
+    decoded = firebase_auth.verify_id_token(token)
+    uid = decoded.get("uid")
+    return uid if isinstance(uid, str) and uid.strip() else None
+
+
+def _require_request_user_id():
+    token = _extract_bearer_token()
+    if not token:
+        return None, (jsonify({"error": "Missing Authorization header"}), 401)
+    try:
+        user_id = _verify_firebase_token(token)
+    except Exception as auth_err:
+        logger.warning(
+            "Invalid Firebase token for path=%s err_type=%s",
+            request.path,
+            type(auth_err).__name__,
+        )
+        return None, (jsonify({"error": "Invalid token"}), 401)
+    if not user_id:
+        return None, (jsonify({"error": "Invalid token"}), 401)
+    return user_id, None
+
+
+def _conversation_access_allowed(
+    conversation_id: Optional[str],
+    user_id: str,
+    allow_if_missing: bool = False,
+) -> bool:
+    if not (db and conversation_id and user_id):
+        return False
+    conv = db.get_conversation(conversation_id)
+    if conv is None:
+        return allow_if_missing
+    return conv.get("user_id") == user_id
+
+
+def _require_ws_user_id(ws) -> Optional[str]:
+    token = _extract_bearer_token()
+    if not token:
+        ws.send(json.dumps({"event": "error", "message": "Missing Authorization header"}))
+        return None
+    try:
+        user_id = _verify_firebase_token(token)
+    except Exception as auth_err:
+        logger.warning("Invalid Firebase WS token err_type=%s", type(auth_err).__name__)
+        ws.send(json.dumps({"event": "error", "message": "Invalid token"}))
+        return None
+    if not user_id:
+        ws.send(json.dumps({"event": "error", "message": "Invalid token"}))
+        return None
+    return user_id
 
 # In-memory speaker registration store (MVP – not persisted across restarts).
 # Keys: conversation_id, Values: dict mapping diarization label to participant name.
@@ -246,12 +319,22 @@ def conversations_create():
         Error 503 if Firestore is unavailable.
         Error 500 on unexpected errors.
     """
+    user_id, error_response = _require_request_user_id()
+    if error_response:
+        return error_response
     if not db:
         return jsonify({"error": "Database not available"}), 503
     data = request.get_json(silent=True) or {}
     conversation_id = data.get("conversation_id") or None
     try:
-        cid = db.create_conversation(conversation_id=conversation_id)
+        # allow_if_missing=True permits first-time creation of an explicit conversation_id.
+        if conversation_id and db and not _conversation_access_allowed(
+            conversation_id,
+            user_id,
+            allow_if_missing=True,
+        ):
+            return jsonify({"error": "Conversation not found"}), 404
+        cid = db.create_conversation(conversation_id=conversation_id, user_id=user_id)
         return jsonify({"conversation_id": cid, "status": "active"}), 201
     except Exception as e:
         logger.exception("conversations_create error: %s", e)
@@ -270,6 +353,9 @@ def conversations_list():
         JSON: {"conversations": [...]}
         Error 503 if Firestore is unavailable.
     """
+    user_id, error_response = _require_request_user_id()
+    if error_response:
+        return error_response
     if not db:
         return jsonify({"error": "Database not available"}), 503
     try:
@@ -277,7 +363,7 @@ def conversations_list():
     except (TypeError, ValueError):
         limit = 50
     try:
-        convs = db.list_conversations(limit=limit)
+        convs = db.list_conversations(limit=limit, user_id=user_id)
         return jsonify({"conversations": convs})
     except Exception as e:
         logger.exception("conversations_list error: %s", e)
@@ -297,11 +383,18 @@ def conversations_get(conversation_id):
         Error 404 if the conversation does not exist.
         Error 503 if Firestore is unavailable.
     """
+    user_id, error_response = _require_request_user_id()
+    if error_response:
+        return error_response
     if not db:
         return jsonify({"error": "Database not available"}), 503
     try:
         conv = db.get_conversation(conversation_id)
         if conv is None:
+            logger.info("Conversation not found conversation_id=%s user_id=%s", conversation_id, user_id)
+            return jsonify({"error": "Conversation not found"}), 404
+        if conv.get("user_id") != user_id:
+            logger.info("Conversation access denied conversation_id=%s user_id=%s", conversation_id, user_id)
             return jsonify({"error": "Conversation not found"}), 404
         conv["messages"] = db.get_messages(conversation_id)
         return jsonify(conv)
@@ -322,9 +415,16 @@ def conversations_messages(conversation_id):
         JSON: {"conversation_id": "...", "messages": [...]}
         Error 503 if Firestore is unavailable.
     """
+    user_id, error_response = _require_request_user_id()
+    if error_response:
+        return error_response
     if not db:
         return jsonify({"error": "Database not available"}), 503
     try:
+        conv = db.get_conversation(conversation_id)
+        if conv is None or conv.get("user_id") != user_id:
+            logger.info("Messages access denied conversation_id=%s user_id=%s", conversation_id, user_id)
+            return jsonify({"error": "Conversation not found"}), 404
         messages = db.get_messages(conversation_id)
         return jsonify({"conversation_id": conversation_id, "messages": messages})
     except Exception as e:
@@ -345,10 +445,21 @@ def speech_finalize():
         Error 400 if conversation_id is missing.
         Error 500 if Firestore operation fails.
     """
+    user_id, error_response = _require_request_user_id()
+    if error_response:
+        return error_response
     data = request.get_json(silent=True) or {}
     conversation_id = data.get("conversation_id")
     if not conversation_id:
         return jsonify({"error": "conversation_id is required"}), 400
+    if db:
+        try:
+            conv = db.get_conversation(conversation_id)
+        except Exception as e:
+            return jsonify({"error": str(e)}), 500
+        if conv is None or conv.get("user_id") != user_id:
+            logger.info("Finalize access denied conversation_id=%s user_id=%s", conversation_id, user_id)
+            return jsonify({"error": "Conversation not found"}), 404
     try:
         speaker_map = speaker_registry.get(conversation_id, {})
         if db:
@@ -446,6 +557,11 @@ def asl_transcribe():
         Error 500 if transcription fails.
     """
     conversation_id = request.form.get("conversation_id")
+    user_id = None
+    if conversation_id:
+        user_id, error_response = _require_request_user_id()
+        if error_response:
+            return error_response
     file = request.files.get("video")
     if not file:
         return jsonify({"error": "video file is required (form field 'video')"}), 400
@@ -470,7 +586,10 @@ def asl_transcribe():
     # Save result to Firestore if conversation_id provided and db is initialized
     try:
         if conversation_id and text and db:
-            db.save_message(conversation_id=conversation_id, text=text, source="asl")
+            if _conversation_access_allowed(conversation_id, user_id):
+                db.save_message(conversation_id=conversation_id, text=text, source="asl", user_id=user_id)
+            else:
+                logger.info("ASL transcribe save denied conversation_id=%s user_id=%s", conversation_id, user_id)
     except Exception:
         pass
 
@@ -504,6 +623,12 @@ def asl_ws(ws):
     conn_id = f"aslws-{int(conn_started_at * 1000)}-{(id(ws) % 100000)}"
     remote = request.remote_addr
     conversation_id: Optional[str] = request.args.get("conversation_id")
+    user_id = _require_ws_user_id(ws)
+    if not user_id:
+        return
+    if conversation_id and db and not _conversation_access_allowed(conversation_id, user_id):
+        ws.send(json.dumps({"event": "error", "message": "Conversation not found"}))
+        return
     logger.info("[%s] OPEN remote=%s path=/asl/ws conversation_id=%s", conn_id, remote, conversation_id)
 
     # Ack immediately so clients are not stuck waiting while model loads.
@@ -741,6 +866,7 @@ def asl_ws(ws):
                                     conversation_id=conversation_id,
                                     text=word,
                                     source="asl",
+                                    user_id=user_id,
                                 )
                         except Exception as _db_err:
                             logger.error("[%s] Firestore save error (asl_result): %s", conn_id, _db_err)
@@ -858,8 +984,14 @@ def speech_ws(ws):
             return normalized
         return f"{normalized[:max_len].rstrip()}..."
 
+    user_id = _require_ws_user_id(ws)
+    if not user_id:
+        return
     # Get conversation_id from query params (optional)
     conversation_id: Optional[str] = request.args.get("conversation_id")
+    if conversation_id and db and not _conversation_access_allowed(conversation_id, user_id):
+        ws.send(json.dumps({"event": "error", "message": "Conversation not found"}))
+        return
     # Mode state machine: 'identifying' or 'captioning'
     initial_mode = request.args.get("mode", "captioning")
     try:
@@ -1035,7 +1167,13 @@ def speech_ws(ws):
                                 if conversation_id and db:
                                     # Persist display name once so conversation lists are readable.
                                     db.set_conversation_display_name_if_missing(conversation_id, transcript)
-                                    db.save_message(conversation_id=conversation_id, text=transcript, source="speech", speaker=speaker)
+                                    db.save_message(
+                                        conversation_id=conversation_id,
+                                        text=transcript,
+                                        source="speech",
+                                        speaker=speaker,
+                                        user_id=user_id,
+                                    )
                                     saved_ok = True
                             except Exception as e:
                                 logger.error("Firestore save error: %s", e)
@@ -1160,6 +1298,12 @@ def speech_ws(ws):
                 if not conversation_id:
                     cid = data.get("conversation_id")
                     if cid:
+                        if db and not _conversation_access_allowed(cid, user_id):
+                            _safe_ws_send(
+                                {"event": "error", "message": "Conversation not found"},
+                                context="audio_chunk_conversation_forbidden",
+                            )
+                            continue
                         conversation_id = cid
                         logger.info("conversation_id adopted from audio_chunk payload: %s", conversation_id)
                 # If previous stream errored (timeout), restart a new stream and consumer
@@ -1184,7 +1328,13 @@ def speech_ws(ws):
                 if not conversation_id:
                     cid = data.get("conversation_id")
                     if cid:
-                        conversation_id = cid
+                        if db and not _conversation_access_allowed(cid, user_id):
+                            _safe_ws_send(
+                                {"event": "error", "message": "Conversation not found"},
+                                context="finish_conversation_forbidden",
+                            )
+                        else:
+                            conversation_id = cid
                 logger.info("event=%s — finishing streamer for conversation_id=%s", event, conversation_id)
                 _mark_ws_closed(reason=f"client_event:{event}")
                 streamer_state["streamer"].finish()
@@ -1205,6 +1355,12 @@ def speech_ws(ws):
                 # Set or update conversation_id mid-session
                 cid = data.get("conversation_id")
                 if cid:
+                    if db and not _conversation_access_allowed(cid, user_id):
+                        _safe_ws_send(
+                            {"event": "error", "message": "Conversation not found"},
+                            context="set_conversation_forbidden",
+                        )
+                        continue
                     conversation_id = cid
                     logger.info("set_conversation updated conversation_id=%s", conversation_id)
             else:
