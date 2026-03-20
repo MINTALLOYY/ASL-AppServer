@@ -34,6 +34,19 @@ class FirestoreDB:
                 result[key] = value
         return result
 
+    @staticmethod
+    def _make_display_name(text: str, max_len: int = 64) -> Optional[str]:
+        """Build a short, readable conversation title from transcript text."""
+        if not isinstance(text, str):
+            return None
+        normalized = " ".join(text.strip().split())
+        if not normalized:
+            return None
+        if len(normalized) <= max_len:
+            return normalized
+        cut = normalized[:max_len].rstrip()
+        return f"{cut}..."
+
     # ── write operations ──────────────────────────────────────────────────────
 
     def create_conversation(self, conversation_id: Optional[str] = None) -> str:
@@ -95,6 +108,36 @@ class FirestoreDB:
             "created_at": firestore.SERVER_TIMESTAMP,
         }
         msg_ref.set(payload)
+
+    def set_conversation_display_name_if_missing(self, conversation_id: str, text: str) -> Optional[str]:
+        """
+        Set conversation display_name from text only when missing.
+
+        Returns:
+            The existing or newly set display name, or None if unavailable.
+        """
+        if not conversation_id:
+            return None
+        display_name = self._make_display_name(text)
+        if not display_name:
+            return None
+
+        conv_ref = self.client.collection("conversations").document(conversation_id)
+        snap = conv_ref.get()
+        existing = None
+        if snap.exists:
+            existing = (snap.to_dict() or {}).get("display_name")
+        if isinstance(existing, str) and existing.strip():
+            return existing
+
+        conv_ref.set(
+            {
+                "display_name": display_name,
+                "updated_at": firestore.SERVER_TIMESTAMP,
+            },
+            merge=True,
+        )
+        return display_name
 
     def finalize_conversation(self, conversation_id: str):
         """

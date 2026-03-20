@@ -803,7 +803,25 @@ def speech_ws(ws):
     
     Audio format: base64-encoded 16 kHz, 16-bit mono PCM (LINEAR16).
     """
+    ws_closed = threading.Event()
+    ws_closed_reason = {"value": None}
+
+    def _mark_ws_closed(reason: str) -> None:
+        if not ws_closed.is_set():
+            ws_closed_reason["value"] = reason
+            ws_closed.set()
+            logger.info("WebSocket marked closed. reason=%s conversation_id=%s", reason, conversation_id)
+
     def _safe_ws_send(payload: dict, context: str) -> bool:
+        if ws_closed.is_set():
+            logger.info(
+                "Skipping WS send because socket already closed. context=%s event=%s reason=%s conversation_id=%s",
+                context,
+                payload.get("event"),
+                ws_closed_reason["value"],
+                conversation_id,
+            )
+            return False
         try:
             serialized = json.dumps(payload)
             ws.send(serialized)
@@ -816,9 +834,29 @@ def speech_ws(ws):
             )
             return True
         except Exception as send_err:
+            err_name = type(send_err).__name__
+            err_text = str(send_err)
+            if err_name == "ConnectionClosed" or "Connection closed" in err_text:
+                _mark_ws_closed(reason=f"send_failed:{context}:{err_name}")
+                logger.info(
+                    "WebSocket closed during send. context=%s event=%s err=%s conversation_id=%s",
+                    context,
+                    payload.get("event"),
+                    send_err,
+                    conversation_id,
+                )
+                return False
             logger.error("WebSocket send error context=%s err=%s payload=%s", context, send_err, payload)
             logger.error(traceback.format_exc())
             return False
+
+    def _display_title_from_text(text: str, max_len: int = 64) -> str:
+        normalized = " ".join((text or "").strip().split())
+        if not normalized:
+            return "Untitled conversation"
+        if len(normalized) <= max_len:
+            return normalized
+        return f"{normalized[:max_len].rstrip()}..."
 
     # Get conversation_id from query params (optional)
     conversation_id: Optional[str] = request.args.get("conversation_id")
@@ -834,6 +872,7 @@ def speech_ws(ws):
         identified_labels[conversation_id] = set()
     # Initialize Google Speech streaming client (with restart capability)
     streamer_state = {"streamer": ChirpStreamer(diarization_speaker_count=num_speakers), "active": True}
+    title_state = {"emitted": False}
 
     # Log when a new WebSocket connection opens
     try:
@@ -923,6 +962,13 @@ def speech_ws(ws):
                                                 "label": label,
                                             }, context="speaker_detected")
                                             if not sent_ok:
+                                                if ws_closed.is_set():
+                                                    logger.info(
+                                                        "speaker_detected not sent because socket is closed. label=%s conversation_id=%s",
+                                                        label,
+                                                        conversation_id,
+                                                    )
+                                                    continue
                                                 streamer_state["streamer"].finish()
                                                 return
                                             logger.info(
@@ -972,6 +1018,27 @@ def speech_ws(ws):
                         except Exception:
                             pass
                         if transcript:
+                            if not title_state["emitted"]:
+                                readable_title = _display_title_from_text(transcript)
+                                title_sent_ok = _safe_ws_send(
+                                    {
+                                        "event": "conversation_title",
+                                        "title": readable_title,
+                                        "conversation_id": conversation_id,
+                                    },
+                                    context="conversation_title",
+                                )
+                                if title_sent_ok or ws_closed.is_set():
+                                    title_state["emitted"] = True
+                            saved_ok = False
+                            try:
+                                if conversation_id and db:
+                                    # Persist display name once so conversation lists are readable.
+                                    db.set_conversation_display_name_if_missing(conversation_id, transcript)
+                                    db.save_message(conversation_id=conversation_id, text=transcript, source="speech", speaker=speaker)
+                                    saved_ok = True
+                            except Exception as e:
+                                logger.error("Firestore save error: %s", e)
                             try:
                                 payload = {
                                     "event": "final_transcript",
@@ -980,6 +1047,13 @@ def speech_ws(ws):
                                 }
                                 sent_ok = _safe_ws_send(payload, context="final_transcript")
                                 if not sent_ok:
+                                    if ws_closed.is_set():
+                                        logger.info(
+                                            "final_transcript not sent because socket is closed. transcript_saved=%s conversation_id=%s",
+                                            saved_ok,
+                                            conversation_id,
+                                        )
+                                        continue
                                     streamer_state["streamer"].finish()
                                     return
                             except Exception as e:
@@ -987,11 +1061,6 @@ def speech_ws(ws):
                                 logger.error(traceback.format_exc())
                                 streamer_state["streamer"].finish()
                                 return
-                            try:
-                                if conversation_id and db:
-                                    db.save_message(conversation_id=conversation_id, text=transcript, source="speech", speaker=speaker)
-                            except Exception as e:
-                                logger.error("Firestore save error: %s", e)
                         else:
                             logger.warning(
                                 "CAPTION final result produced empty transcript; nothing sent to client. speaker=%s conversation_id=%s",
@@ -1039,6 +1108,7 @@ def speech_ws(ws):
                             msg_count, type(msg).__name__, len(msg) if msg else 0)
             if msg is None:
                 logger.info("WebSocket receive returned None — client disconnected")
+                _mark_ws_closed(reason="receive_none")
                 break
             try:
                 data = json.loads(msg)
@@ -1116,6 +1186,7 @@ def speech_ws(ws):
                     if cid:
                         conversation_id = cid
                 logger.info("event=%s — finishing streamer for conversation_id=%s", event, conversation_id)
+                _mark_ws_closed(reason=f"client_event:{event}")
                 streamer_state["streamer"].finish()
                 break
             elif event == "begin_captioning":
@@ -1140,8 +1211,10 @@ def speech_ws(ws):
                 # Ignore unknown events
                 logger.info("Unknown websocket event received: %s payload=%s", event, data)
     except Exception:
+        _mark_ws_closed(reason="main_loop_exception")
         logger.exception("Exception in WebSocket main loop")
     finally:
+        _mark_ws_closed(reason="handler_finally")
         # Clean up streaming resources
         try:
             streamer_state["streamer"].finish()
