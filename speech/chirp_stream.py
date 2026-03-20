@@ -1,15 +1,45 @@
 import base64
-import audioop
 import queue
 import threading
 import traceback
 import logging
 import time
+import math
 from typing import Generator, Optional
 
 from google.cloud import speech_v1 as speech
 
 logger = logging.getLogger(__name__)
+
+
+def _pcm16_rms_peak(audio_bytes: bytes) -> tuple[int, int]:
+    """
+    Compute RMS and peak amplitude for little-endian signed 16-bit PCM bytes.
+
+    Returns (rms, peak). Returns (0, 0) for empty/too-short input.
+    """
+    byte_len = len(audio_bytes)
+    if byte_len < 2:
+        return 0, 0
+
+    # Keep only complete 16-bit samples.
+    usable_len = byte_len - (byte_len % 2)
+    if usable_len <= 0:
+        return 0, 0
+
+    sample_count = usable_len // 2
+    sum_squares = 0
+    peak = 0
+
+    for i in range(0, usable_len, 2):
+        sample = int.from_bytes(audio_bytes[i:i + 2], byteorder="little", signed=True)
+        abs_sample = abs(sample)
+        if abs_sample > peak:
+            peak = abs_sample
+        sum_squares += sample * sample
+
+    rms = int(math.sqrt(sum_squares / sample_count)) if sample_count else 0
+    return rms, peak
 
 
 class ChirpStreamer:
@@ -75,8 +105,7 @@ class ChirpStreamer:
             decoded_len = len(decoded)
             self._received_audio_bytes += decoded_len
             try:
-                rms = int(audioop.rms(decoded, 2)) if decoded_len >= 2 else 0
-                peak = int(audioop.max(decoded, 2)) if decoded_len >= 2 else 0
+                rms, peak = _pcm16_rms_peak(decoded)
             except Exception:
                 rms = -1
                 peak = -1
