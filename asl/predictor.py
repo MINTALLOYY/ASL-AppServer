@@ -409,9 +409,10 @@ class ASLPredictor:
             except:
                 hand_name = ""
             
-            if hand_name == "left" or not np.any(lh):
+            # Explicitly assign to the correct hand instead of overwriting based on emptiness
+            if hand_name == "left":
                 lh = coords
-            else:
+            elif hand_name == "right":
                 rh = coords
 
         pose = np.zeros((13, 2), dtype=np.float32)
