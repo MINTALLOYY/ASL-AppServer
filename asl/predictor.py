@@ -118,14 +118,17 @@ class GCN_muti_att(nn.Module):
 
 class ASLPredictor:
     def __init__(self, model_path: str, labels_path: str):
-        logger.info("Initializing ASL PyTorch TGCN model from sharonn18/tgcn-wlasl (ASL100)...")
-        # Load from HF or given path:
+        logger.info("Initializing ASL PyTorch TGCN model from WLASL-100 configuration...")
+        
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'mps' if torch.backends.mps.is_available() else 'cpu')
-        try:
-            self.model_path = hf_hub_download('sharonn18/tgcn-wlasl', 'checkpoints/asl100/pytorch_model.bin')
-        except Exception as e:
-            logger.warning(f"Could not download checkpoint: {e}. Falling back to default.")
-            self.model_path = model_path
+        self.model_path = model_path
+        
+        if not os.path.exists(self.model_path):
+            logger.warning(f"Local checkpoint {self.model_path} not found. Attempting download from HF...")
+            try:
+                self.model_path = hf_hub_download('sharonn18/tgcn-wlasl', 'checkpoints/asl100/pytorch_model.bin')
+            except Exception as e:
+                logger.error(f"HF download failed: {e}")
             
         # TGCN config for asl100
         self.num_samples = 50
@@ -338,6 +341,25 @@ class ASLPredictor:
         feats, _ = self.extract_features_and_debug(frame_bgr)
         return feats
 
+    def _map_pose_to_wlasl13(self, p: np.ndarray) -> np.ndarray:
+        if p.shape[0] < 33:
+            return np.zeros((13, 2), dtype=np.float32)
+        return np.array([
+            p[0],                # 0: Nose
+            (p[11] + p[12]) / 2, # 1: Neck
+            p[12],               # 2: R Shoulder
+            p[14],               # 3: R Elbow
+            p[16],               # 4: R Wrist
+            p[11],               # 5: L Shoulder
+            p[13],               # 6: L Elbow
+            p[15],               # 7: L Wrist
+            (p[23] + p[24]) / 2, # 8: MidHip
+            p[5],                # 9: R Eye
+            p[2],                # 10: L Eye
+            p[8],                # 11: R Ear
+            p[7],                # 12: L Ear
+        ], dtype=np.float32)
+
     def extract_features_and_debug(self, frame_bgr: np.ndarray) -> tuple[np.ndarray, dict]:
         with self._infer_lock:
             rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
@@ -348,23 +370,30 @@ class ASLPredictor:
 
         def lm_array(lm_list, n):
             if lm_list:
-                return np.array([[l.x, l.y] for l in lm_list.landmark]) # Only x, y
-            return np.zeros((n, 2))
+                return np.array([[l.x, l.y] for l in lm_list.landmark], dtype=np.float32)
+            return np.zeros((n, 2), dtype=np.float32)
 
-        pose = lm_array(results.pose_landmarks, 33)[:13] # only first 13 pose joints
+        pose_full = lm_array(results.pose_landmarks, 33)
+        pose = self._map_pose_to_wlasl13(pose_full)
         lh = lm_array(results.left_hand_landmarks, 21)
         rh = lm_array(results.right_hand_landmarks, 21)
 
         feats = self._compose_features(pose, lh, rh)
-        return feats.astype(np.float32), {}
+        return feats, {}
 
     def _compose_features(self, pose: np.ndarray, lh: np.ndarray, rh: np.ndarray) -> np.ndarray:
         # Expected TGCN joints: 55 = 13 pose + 21 lh + 21 rh
-        # Each is (N, 2)
         raw = np.concatenate([pose, lh, rh], axis=0) # (55, 2)
         if raw.shape[0] < 55:
             raw = np.pad(raw, ((0, 55 - raw.shape[0]), (0, 0)), mode="constant")
-        return raw[:55]
+        raw = raw[:55]
+        
+        # WLASL expects coordinates mapped from [0, 1] to [-1, 1]
+        zero_mask = (raw[:, 0] == 0) & (raw[:, 1] == 0)
+        raw = 2.0 * raw - 1.0
+        raw[zero_mask] = 0.0  # Keep missing points exactly zero
+        
+        return raw.astype(np.float32)
 
     def _extract_keypoints_tasks_with_debug(self, frame_rgb: np.ndarray) -> tuple[np.ndarray, dict]:
         image = self._tasks_image_cls(image_format=self._tasks_image_format, data=frame_rgb)
@@ -390,12 +419,10 @@ class ASLPredictor:
             pose_result = self._tasks_pose.detect(image)
             if pose_result.pose_landmarks:
                 pose_full = np.array([[lm.x, lm.y] for lm in pose_result.pose_landmarks[0]], dtype=np.float32)
-                pose = pose_full[:13]
-                if pose.shape[0] < 13:
-                    pose = np.pad(pose, ((0, 13 - pose.shape[0]), (0,0)), mode="constant")
+                pose = self._map_pose_to_wlasl13(pose_full)
 
         feats = self._compose_features(pose, lh, rh)
-        return feats.astype(np.float32), {}
+        return feats, {}
 
     def process_frame(self, frame_bytes: bytes) -> str | None:
         np_arr = np.frombuffer(frame_bytes, np.uint8)

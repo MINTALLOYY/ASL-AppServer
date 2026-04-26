@@ -20,7 +20,7 @@ def get_predictor() -> "ASLPredictor":
         import os
         base = os.path.dirname(__file__)
         _predictor = ASLPredictor(
-            model_path=os.path.join(base, "asl_model.keras"),
+            model_path=os.path.join(base, "asl_model.bin"),
             labels_path=os.path.join(base, "label_map.json"),
         )
     return _predictor
