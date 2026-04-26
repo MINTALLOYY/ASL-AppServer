@@ -39,6 +39,9 @@ class ASLPredictor:
         # Supports (batch, seq, features), usually features=126 (hands) or 225 (pose+hands)
         self.feature_dim = int(self.model.input_shape[-1])
         logger.info("ASL model feature dimension: %s", self.feature_dim)
+        self.runtime_inference_ok = True
+        self.runtime_issue = ""
+        self._saved_weights_are_valid = self._validate_saved_weights()
 
         with open(labels_path, "r") as f:
             label_map = json.load(f)
@@ -86,9 +89,169 @@ class ASLPredictor:
         self.frame_buffer = deque(maxlen=SEQUENCE_LENGTH)
         self.frame_count = 0
         self._infer_lock = threading.Lock()
-        self.runtime_inference_ok = True
-        self.runtime_issue = ""
         self._run_runtime_sanity_check()
+
+    def _validate_saved_weights(self) -> bool:
+        """Check whether the loaded checkpoint contains only finite weights."""
+        try:
+            weights = self.model.get_weights()
+        except Exception as exc:
+            self.runtime_inference_ok = False
+            self.runtime_issue = f"Could not inspect model weights: {exc}"
+            logger.exception("ASL weight validation failed: %s", exc)
+            return False
+
+        has_nan = any(np.isnan(weight).any() for weight in weights)
+        has_inf = any(np.isinf(weight).any() for weight in weights)
+        if has_nan or has_inf:
+            self.runtime_inference_ok = False
+            self.runtime_issue = (
+                "Saved ASL model weights contain NaN/Inf values. "
+                "The checkpoint is corrupted or incompatible with this runtime."
+            )
+            logger.error(
+                "ASL checkpoint invalid: weights contain non-finite values (nan=%s inf=%s)",
+                has_nan,
+                has_inf,
+            )
+            return False
+
+        return True
+
+    def _predict_probs(self, seq: np.ndarray) -> np.ndarray:
+        """Run a single sequence through the model and return a normalized probability vector."""
+        if not self.runtime_inference_ok:
+            raise RuntimeError(self.runtime_issue or "ASL model runtime is not healthy")
+        if seq.ndim == 2:
+            seq = np.expand_dims(seq, axis=0)
+        if seq.ndim != 3:
+            raise ValueError(f"Expected sequence rank 3, got shape {seq.shape}")
+
+        with self._infer_lock:
+            probs = self.model.predict(seq, verbose=0)[0]
+
+        if not np.isfinite(probs).all():
+            logger.warning(
+                "ASL predict_probs produced non-finite values nan=%s posinf=%s neginf=%s; sanitizing",
+                int(np.isnan(probs).sum()),
+                int(np.isposinf(probs).sum()),
+                int(np.isneginf(probs).sum()),
+            )
+            probs = np.nan_to_num(probs, nan=0.0, posinf=1.0, neginf=0.0)
+
+        total_prob = float(np.sum(probs))
+        if total_prob > 0.0:
+            probs = probs / total_prob
+        else:
+            probs = np.zeros_like(probs)
+
+        return probs.astype(np.float32)
+
+    def _top_predictions(self, probs: np.ndarray, top_k: int = 3) -> list[dict]:
+        """Convert a probability vector into a JSON-friendly ranked prediction list."""
+        if probs.size == 0:
+            return []
+
+        top_k = max(1, min(int(top_k), int(probs.shape[0])))
+        ranked = np.argsort(probs)[::-1][:top_k]
+        results = []
+        for idx in ranked:
+            results.append(
+                {
+                    "index": int(idx),
+                    "label": self.labels.get(int(idx), f"unknown_{int(idx)}"),
+                    "confidence": round(float(probs[idx]), 4),
+                }
+            )
+        return results
+
+    def predict_sequence(self, seq: np.ndarray, top_k: int = 3) -> dict:
+        """Predict a single temporal window of keypoint features."""
+        probs = self._predict_probs(seq)
+        top_predictions = self._top_predictions(probs, top_k=top_k)
+        best = top_predictions[0] if top_predictions else None
+        return {
+            "best_prediction": best,
+            "top_predictions": top_predictions,
+        }
+
+    def transcribe_video_file(self, file_path: str, top_k: int = 3) -> dict:
+        """Transcribe a video file into a ranked ASL prediction payload."""
+        cap = cv2.VideoCapture(file_path)
+        if not cap.isOpened():
+            logger.error("Could not open video: %s", file_path)
+            return {
+                "text": "",
+                "best_prediction": None,
+                "top_predictions": [],
+                "frames_processed": 0,
+                "windows_evaluated": 0,
+            }
+
+        frame_features: list[np.ndarray] = []
+        frame_count = 0
+        try:
+            while True:
+                ret, frame = cap.read()
+                if not ret:
+                    break
+                frame_count += 1
+                frame_features.append(self._extract_keypoints(frame))
+        finally:
+            cap.release()
+
+        if not frame_features:
+            return {
+                "text": "",
+                "best_prediction": None,
+                "top_predictions": [],
+                "frames_processed": frame_count,
+                "windows_evaluated": 0,
+            }
+
+        if len(frame_features) < SEQUENCE_LENGTH:
+            last_frame = frame_features[-1]
+            frame_features.extend([last_frame.copy() for _ in range(SEQUENCE_LENGTH - len(frame_features))])
+
+        windows: list[np.ndarray] = []
+        for start in range(0, len(frame_features) - SEQUENCE_LENGTH + 1, STRIDE):
+            window = np.stack(frame_features[start : start + SEQUENCE_LENGTH]).astype(np.float32)
+            windows.append(window)
+
+        if not windows:
+            windows.append(np.stack(frame_features[-SEQUENCE_LENGTH:]).astype(np.float32))
+
+        accumulated_probs = None
+        for window in windows:
+            probs = self._predict_probs(window[np.newaxis, ...])
+            if accumulated_probs is None:
+                accumulated_probs = np.zeros_like(probs)
+            accumulated_probs += probs
+
+        if accumulated_probs is None:
+            return {
+                "text": "",
+                "best_prediction": None,
+                "top_predictions": [],
+                "frames_processed": frame_count,
+                "windows_evaluated": 0,
+            }
+
+        averaged_probs = accumulated_probs / float(len(windows))
+        top_predictions = self._top_predictions(averaged_probs, top_k=top_k)
+        best_prediction = top_predictions[0] if top_predictions else None
+
+        text = ""
+        if best_prediction and best_prediction["confidence"] >= CONFIDENCE:
+            text = best_prediction["label"]
+
+        return {
+            "text": text,
+            "best_prediction": best_prediction,
+            "top_predictions": top_predictions,
+            "frames_processed": frame_count,
+            "windows_evaluated": len(windows),
+        }
 
     @property
     def backend(self) -> str:
@@ -96,6 +259,9 @@ class ASLPredictor:
 
     def _run_runtime_sanity_check(self) -> None:
         """Detect broken TF runtime early (e.g. all-NaN outputs on valid tensors)."""
+        # Keep an earlier, more specific startup failure reason (e.g., corrupted weights).
+        if not self.runtime_inference_ok:
+            return
         try:
             zero_seq = np.zeros((1, SEQUENCE_LENGTH, self.feature_dim), dtype=np.float32)
             rand_seq = np.random.rand(1, SEQUENCE_LENGTH, self.feature_dim).astype(np.float32)
@@ -109,8 +275,8 @@ class ASLPredictor:
                 self.runtime_inference_ok = False
                 self.runtime_issue = (
                     "Model outputs are non-finite (NaN/Inf). "
-                    "This commonly indicates an incompatible TensorFlow/Python runtime. "
-                    "Use Python 3.11.x on Render and redeploy."
+                    "This often indicates an incompatible TensorFlow/Python runtime or an invalid checkpoint. "
+                    "Use Python 3.11.x and verify the model file."
                 )
                 logger.error(
                     "ASL runtime sanity check failed: zero_finite=%s rand_finite=%s zero_nan=%s rand_nan=%s",
@@ -325,8 +491,7 @@ class ASLPredictor:
         if (len(self.frame_buffer) == SEQUENCE_LENGTH
             and self.frame_count % STRIDE == 0):
             seq = np.expand_dims(np.array(self.frame_buffer), axis=0)  # (1, 30, 126)
-            with self._infer_lock:
-                probs = self.model.predict(seq, verbose=0)[0]
+            probs = self._predict_probs(seq)
             best = int(np.argmax(probs))
             conf = float(probs[best])
             candidate = self.labels.get(best, f"unknown_{best}")

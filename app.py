@@ -17,7 +17,7 @@ import sys
 from firebase.db import FirestoreDB
 from speech.chirp_stream import ChirpStreamer, speaker_label_from_result
 
-from asl.asl_inference import transcribe_video, get_predictor
+from asl.asl_inference import transcribe_video_details, get_predictor
 
 load_dotenv()
 
@@ -174,6 +174,13 @@ def asl_diagnostics():
 def asl_test_page():
     """Serve the ASL browser test page from this Flask app."""
     return send_file("test_asl.html")
+
+
+@app.route("/asl/upload-test", methods=["GET"], strict_slashes=False)
+@app.get("/test_asl_upload.html")
+def asl_upload_test_page():
+    """Serve the simple ASL video upload test page."""
+    return send_file("test_asl_upload.html")
 
 
 @app.get("/ws-info")
@@ -455,8 +462,8 @@ def asl_transcribe():
         with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as tmp:
             file.save(tmp.name)
             tmp_path = tmp.name
-        # Run ASL inference (stubbed for now)
-        text = transcribe_video(tmp_path)
+        # Run ASL inference using the structured clip transcription path.
+        result = transcribe_video_details(tmp_path)
     except Exception as e:
         return jsonify({"error": str(e)}), 500
     finally:
@@ -469,12 +476,19 @@ def asl_transcribe():
 
     # Save result to Firestore if conversation_id provided and db is initialized
     try:
-        if conversation_id and text and db:
-            db.save_message(conversation_id=conversation_id, text=text, source="asl")
+        if conversation_id and result.get("text") and db:
+            db.save_message(conversation_id=conversation_id, text=result["text"], source="asl")
     except Exception:
         pass
 
-    return jsonify({"text": text})
+    response_payload = {
+        "text": result.get("text", ""),
+        "best_prediction": result.get("best_prediction"),
+        "top_predictions": result.get("top_predictions", []),
+        "frames_processed": result.get("frames_processed", 0),
+        "windows_evaluated": result.get("windows_evaluated", 0),
+    }
+    return jsonify(response_payload)
 
 
 @sock.route("/asl/ws")
@@ -1237,5 +1251,5 @@ def speech_ws(ws):
 
 # Run the Flask app
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5000))
+    port = int(os.environ.get("PORT", 5001))
     app.run(host="0.0.0.0", port=port)

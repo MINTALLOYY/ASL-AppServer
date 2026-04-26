@@ -1,0 +1,266 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>ASL Upload Test</title>
+  <style>
+    body {
+      margin: 0;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+      background: #111;
+      color: #eee;
+      padding: 20px;
+    }
+
+    .card {
+      max-width: 760px;
+      margin: 0 auto;
+      border: 1px solid #333;
+      border-radius: 8px;
+      padding: 16px;
+      background: #181818;
+    }
+
+    .row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin-bottom: 12px;
+    }
+
+    label {
+      display: block;
+      margin-bottom: 6px;
+      color: #aaa;
+    }
+
+    input[type="text"] {
+      width: 100%;
+      padding: 8px;
+      border-radius: 6px;
+      border: 1px solid #444;
+      background: #0f0f0f;
+      color: #eee;
+      box-sizing: border-box;
+    }
+
+    button {
+      padding: 8px 12px;
+      border-radius: 6px;
+      border: 1px solid #444;
+      background: #222;
+      color: #eee;
+      cursor: pointer;
+    }
+
+    button:disabled {
+      opacity: 0.5;
+      cursor: not-allowed;
+    }
+
+    video {
+      width: 100%;
+      max-width: 420px;
+      border: 1px solid #333;
+      border-radius: 6px;
+      background: #000;
+      display: block;
+      margin-bottom: 8px;
+    }
+
+    #status {
+      margin-top: 8px;
+      color: #9ecbff;
+      min-height: 20px;
+    }
+
+    pre {
+      white-space: pre-wrap;
+      word-wrap: break-word;
+      background: #0f0f0f;
+      border: 1px solid #333;
+      border-radius: 6px;
+      padding: 10px;
+      min-height: 100px;
+      color: #7dffb2;
+    }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h2>ASL Video Upload Test</h2>
+    <p>Record 2-4 seconds of signing, then upload to <code>/asl/transcribe</code>.</p>
+
+    <label for="baseUrl">Server Base URL</label>
+    <input id="baseUrl" type="text" value="" />
+
+    <label for="conversationId" style="margin-top:10px">Conversation ID (optional)</label>
+    <input id="conversationId" type="text" placeholder="conv-123" />
+
+    <div class="row" style="margin-top:12px">
+      <button id="startPreviewBtn">Start Camera</button>
+      <button id="startRecordBtn" disabled>Start Recording</button>
+      <button id="stopRecordBtn" disabled>Stop Recording</button>
+      <button id="uploadBtn" disabled>Upload Clip</button>
+    </div>
+
+    <video id="preview" autoplay muted playsinline></video>
+    <video id="playback" controls playsinline></video>
+
+    <div id="status">Idle</div>
+
+    <h3>Response</h3>
+    <pre id="response">No response yet.</pre>
+  </div>
+
+  <script>
+    const preview = document.getElementById('preview');
+    const playback = document.getElementById('playback');
+    const baseUrlInput = document.getElementById('baseUrl');
+    const conversationInput = document.getElementById('conversationId');
+    const statusEl = document.getElementById('status');
+    const responseEl = document.getElementById('response');
+
+    const startPreviewBtn = document.getElementById('startPreviewBtn');
+    const startRecordBtn = document.getElementById('startRecordBtn');
+    const stopRecordBtn = document.getElementById('stopRecordBtn');
+    const uploadBtn = document.getElementById('uploadBtn');
+
+    let mediaStream = null;
+    let mediaRecorder = null;
+    let recordedChunks = [];
+    let recordedBlob = null;
+
+    if (location.protocol.startsWith('http')) {
+      baseUrlInput.value = `${location.protocol}//${location.host}`;
+    } else {
+      baseUrlInput.value = 'http://127.0.0.1:5001';
+    }
+
+    function setStatus(msg) {
+      statusEl.textContent = msg;
+      console.log('[ASL upload test]', msg);
+    }
+
+    async function startPreview() {
+      try {
+        mediaStream = await navigator.mediaDevices.getUserMedia({
+          video: { width: 640, height: 480, frameRate: { ideal: 24, max: 30 } },
+          audio: false,
+        });
+        preview.srcObject = mediaStream;
+        startRecordBtn.disabled = false;
+        setStatus('Camera ready.');
+      } catch (err) {
+        setStatus(`Camera error: ${err.message}`);
+      }
+    }
+
+    function startRecording() {
+      if (!mediaStream) {
+        setStatus('Start camera first.');
+        return;
+      }
+
+      recordedChunks = [];
+      recordedBlob = null;
+      uploadBtn.disabled = true;
+
+      const mimeCandidates = [
+        'video/mp4;codecs=h264',
+        'video/webm;codecs=vp9',
+        'video/webm;codecs=vp8',
+        'video/webm',
+      ];
+      let mimeType = '';
+      for (const candidate of mimeCandidates) {
+        if (MediaRecorder.isTypeSupported(candidate)) {
+          mimeType = candidate;
+          break;
+        }
+      }
+
+      mediaRecorder = mimeType ? new MediaRecorder(mediaStream, { mimeType }) : new MediaRecorder(mediaStream);
+
+      mediaRecorder.ondataavailable = (event) => {
+        if (event.data && event.data.size > 0) {
+          recordedChunks.push(event.data);
+        }
+      };
+
+      mediaRecorder.onstop = () => {
+        recordedBlob = new Blob(recordedChunks, { type: mediaRecorder.mimeType || 'video/webm' });
+        const url = URL.createObjectURL(recordedBlob);
+        playback.src = url;
+        uploadBtn.disabled = !recordedBlob;
+        setStatus(`Recording ready (${Math.round(recordedBlob.size / 1024)} KB).`);
+      };
+
+      mediaRecorder.start();
+      startRecordBtn.disabled = true;
+      stopRecordBtn.disabled = false;
+      setStatus('Recording... sign your word now.');
+    }
+
+    function stopRecording() {
+      if (!mediaRecorder || mediaRecorder.state === 'inactive') {
+        return;
+      }
+      mediaRecorder.stop();
+      stopRecordBtn.disabled = true;
+      startRecordBtn.disabled = false;
+      setStatus('Stopped recording. Preparing clip...');
+    }
+
+    async function uploadClip() {
+      if (!recordedBlob) {
+        setStatus('No clip recorded yet.');
+        return;
+      }
+
+      const baseUrl = baseUrlInput.value.trim().replace(/\/$/, '');
+      const endpoint = `${baseUrl}/asl/transcribe`;
+      const formData = new FormData();
+
+      const ext = recordedBlob.type.includes('mp4') ? 'mp4' : 'webm';
+      formData.append('video', recordedBlob, `asl_clip.${ext}`);
+
+      const conversationId = conversationInput.value.trim();
+      if (conversationId) {
+        formData.append('conversation_id', conversationId);
+      }
+
+      uploadBtn.disabled = true;
+      setStatus('Uploading clip and waiting for ASL prediction...');
+
+      try {
+        const response = await fetch(endpoint, {
+          method: 'POST',
+          body: formData,
+        });
+
+        const body = await response.json();
+        responseEl.textContent = JSON.stringify(body, null, 2);
+
+        if (!response.ok) {
+          setStatus(`Server error (${response.status}).`);
+        } else {
+          const best = body.best_prediction && body.best_prediction.label ? body.best_prediction.label : '(none)';
+          setStatus(`Done. Best prediction: ${best}`);
+        }
+      } catch (err) {
+        responseEl.textContent = String(err);
+        setStatus(`Upload failed: ${err.message}`);
+      } finally {
+        uploadBtn.disabled = false;
+      }
+    }
+
+    startPreviewBtn.addEventListener('click', startPreview);
+    startRecordBtn.addEventListener('click', startRecording);
+    stopRecordBtn.addEventListener('click', stopRecording);
+    uploadBtn.addEventListener('click', uploadClip);
+  </script>
+</body>
+</html>

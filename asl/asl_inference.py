@@ -37,27 +37,14 @@ def transcribe_video(file_path: str) -> str:
     Returns:
         Transcribed text string (space-separated predicted words).
     """
+    return transcribe_video_details(file_path).get("text", "")
+
+
+def transcribe_video_details(file_path: str) -> dict:
+    """Return a structured ASL transcription payload for a video file."""
     predictor = get_predictor()
     predictor.reset()
-
-    cap = cv2.VideoCapture(file_path)
-    if not cap.isOpened():
-        logger.error("Could not open video: %s", file_path)
-        return ""
-
-    words = []
     try:
-        while True:
-            ret, frame = cap.read()
-            if not ret:
-                break
-            # Encode frame as JPEG bytes for the predictor
-            _, buf = cv2.imencode(".jpg", frame)
-            word = predictor.process_frame(buf.tobytes())
-            if word:
-                words.append(word)
+        return predictor.transcribe_video_file(file_path)
     finally:
-        cap.release()
         predictor.reset()
-
-    return " ".join(words) if words else ""
