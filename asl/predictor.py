@@ -389,9 +389,9 @@ class ASLPredictor:
         raw = raw[:55]
         
         # WLASL expects coordinates mapped from [0, 1] to [-1, 1]
-        zero_mask = (raw[:, 0] == 0) & (raw[:, 1] == 0)
+        # In OpenPose, missing keypoints were (0,0), which mapped to (-1, -1) [top left].
+        # We previously forced missing hands to 0.0, putting "phantom" hands directly in the center of the chest!
         raw = 2.0 * raw - 1.0
-        raw[zero_mask] = 0.0  # Keep missing points exactly zero
         
         return raw.astype(np.float32)
 
