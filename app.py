@@ -458,6 +458,15 @@ def asl_transcribe():
         return jsonify({"error": "video file is required (form field 'video')"}), 400
 
     try:
+        predictor = get_predictor()
+        if not bool(getattr(predictor, "runtime_inference_ok", True)):
+            issue = getattr(predictor, "runtime_issue", "ASL predictor is not ready")
+            return jsonify({"error": issue}), 503
+    except Exception as e:
+        logger.exception("ASL predictor preflight failed: %s", e)
+        return jsonify({"error": f"ASL predictor initialization failed: {e}"}), 500
+
+    try:
         # Save uploaded video to temp file
         with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as tmp:
             file.save(tmp.name)

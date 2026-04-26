@@ -16,13 +16,19 @@ class TestAslTranscribeRoute(unittest.TestCase):
     def setUp(self):
         self.client = server_app.app.test_client()
         self.mock_db = MagicMock()
+        self.mock_predictor = MagicMock()
         self._orig_db = server_app.db
         self._orig_transcribe = server_app.transcribe_video_details
+        self._orig_get_predictor = server_app.get_predictor
         server_app.db = self.mock_db
+        self.mock_predictor.runtime_inference_ok = True
+        self.mock_predictor.runtime_issue = ""
+        server_app.get_predictor = MagicMock(return_value=self.mock_predictor)
 
     def tearDown(self):
         server_app.db = self._orig_db
         server_app.transcribe_video_details = self._orig_transcribe
+        server_app.get_predictor = self._orig_get_predictor
 
     def test_asl_transcribe_returns_structured_payload(self):
         server_app.transcribe_video_details = MagicMock(return_value={
@@ -86,6 +92,22 @@ class TestAslTranscribeRoute(unittest.TestCase):
         )
         self.assertEqual(resp.status_code, 400)
         self.assertIn("error", resp.get_json())
+
+    def test_asl_transcribe_predictor_unhealthy_returns_503(self):
+        self.mock_predictor.runtime_inference_ok = False
+        self.mock_predictor.runtime_issue = "Saved ASL model weights contain NaN/Inf values"
+        payload = {
+            "video": (io.BytesIO(b"fake video bytes"), "clip.mp4"),
+        }
+        resp = self.client.post(
+            "/asl/transcribe",
+            data=payload,
+            content_type="multipart/form-data",
+        )
+        self.assertEqual(resp.status_code, 503)
+        body = resp.get_json()
+        self.assertIn("error", body)
+        self.assertIn("NaN/Inf", body["error"])
 
 
 if __name__ == "__main__":
