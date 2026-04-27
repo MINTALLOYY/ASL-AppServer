@@ -16,19 +16,21 @@ def main():
             
         h, w, _ = frame.shape
         
-        # 1. Extract 55 specific WLASL points in [-1, 1] range
+        # 1. Extract 55 model points in either [0,1] (default) or [-1,1] (legacy toggle)
         feats, _ = predictor.extract_features_and_debug(frame)
         
         # 2. Draw directly what the model receives
         for i, point in enumerate(feats):
-            # Skip drawing the [-1, -1] phantom hands 
-            # (which we mathematically banished to the top left)
-            if point[0] <= -0.99 and point[1] <= -0.99:
-                continue
-                
-            # Convert [-1, 1] back to [0, w] and [0, h] for drawing
-            x_norm = (point[0] + 1.0) / 2.0
-            y_norm = (point[1] + 1.0) / 2.0
+            if predictor._use_neg1_pos1:
+                if point[0] <= -0.99 and point[1] <= -0.99:
+                    continue
+                # Convert [-1, 1] back to [0, 1] for drawing
+                x_norm = (point[0] + 1.0) / 2.0
+                y_norm = (point[1] + 1.0) / 2.0
+            else:
+                # In [0,1] mode, missing keypoints are (0,0) and valid keypoints are clamped to screen.
+                x_norm = float(np.clip(point[0], 0.0, 1.0))
+                y_norm = float(np.clip(point[1], 0.0, 1.0))
             
             x = int(x_norm * w)
             y = int(y_norm * h)

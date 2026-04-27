@@ -193,6 +193,17 @@ class ASLPredictor:
             self.holistic = None
         self.frame_buffer = deque(maxlen=SEQUENCE_LENGTH)
         self.frame_count = 0
+        self._prediction_history = deque(maxlen=5)
+        self._landmark_hold_frames = int(os.getenv("ASL_LANDMARK_HOLD_FRAMES", "6"))
+        self._min_consensus = int(os.getenv("ASL_MIN_PREDICTION_CONSENSUS", "3"))
+        self._min_top1_margin = float(os.getenv("ASL_MIN_TOP1_MARGIN", "0.12"))
+        self._use_neg1_pos1 = os.getenv("ASL_USE_NEG1_POS1", "0") == "1"
+        self._last_lh = np.zeros((21, 2), dtype=np.float32)
+        self._last_rh = np.zeros((21, 2), dtype=np.float32)
+        self._last_pose = np.zeros((13, 2), dtype=np.float32)
+        self._lh_hold = 0
+        self._rh_hold = 0
+        self._pose_hold = 0
         self._infer_lock = threading.Lock()
 
     def reset(self) -> None:
@@ -200,7 +211,28 @@ class ASLPredictor:
         with self._infer_lock:
             self.frame_buffer.clear()
             self.frame_count = 0
+            self._prediction_history.clear()
+            self._last_lh.fill(0)
+            self._last_rh.fill(0)
+            self._last_pose.fill(0)
+            self._lh_hold = 0
+            self._rh_hold = 0
+            self._pose_hold = 0
             logger.info("ASLPredictor state reset.")
+
+    def _stabilize_landmarks(
+        self,
+        current: np.ndarray,
+        last: np.ndarray,
+        hold_counter: int,
+    ) -> tuple[np.ndarray, int]:
+        # MediaPipe can drop landmarks for a few frames. Reuse recent coordinates briefly to avoid
+        # injecting sudden (-1, -1) spikes into the temporal sequence.
+        if np.any(current):
+            return current, self._landmark_hold_frames
+        if hold_counter > 0 and np.any(last):
+            return last.copy(), hold_counter - 1
+        return current, 0
 
     def _predict_probs(self, seq: np.ndarray) -> np.ndarray:
         if not self.runtime_inference_ok:
@@ -378,6 +410,13 @@ class ASLPredictor:
         lh = lm_array(results.left_hand_landmarks, 21)
         rh = lm_array(results.right_hand_landmarks, 21)
 
+        lh, self._lh_hold = self._stabilize_landmarks(lh, self._last_lh, self._lh_hold)
+        rh, self._rh_hold = self._stabilize_landmarks(rh, self._last_rh, self._rh_hold)
+        pose, self._pose_hold = self._stabilize_landmarks(pose, self._last_pose, self._pose_hold)
+        self._last_lh = lh.copy()
+        self._last_rh = rh.copy()
+        self._last_pose = pose.copy()
+
         feats = self._compose_features(pose, lh, rh)
         return feats, {}
 
@@ -387,11 +426,11 @@ class ASLPredictor:
         if raw.shape[0] < 55:
             raw = np.pad(raw, ((0, 55 - raw.shape[0]), (0, 0)), mode="constant")
         raw = raw[:55]
-        
-        # WLASL expects coordinates mapped from [0, 1] to [-1, 1]
-        # In OpenPose, missing keypoints were (0,0), which mapped to (-1, -1) [top left].
-        # We previously forced missing hands to 0.0, putting "phantom" hands directly in the center of the chest!
-        raw = 2.0 * raw - 1.0
+
+        # Keep MediaPipe coordinates in [0, 1] by default.
+        # Optional fallback: ASL_USE_NEG1_POS1=1 for legacy experiments.
+        if self._use_neg1_pos1:
+            raw = 2.0 * raw - 1.0
         
         return raw.astype(np.float32)
 
@@ -422,6 +461,13 @@ class ASLPredictor:
                 pose_full = np.array([[lm.x, lm.y] for lm in pose_result.pose_landmarks[0]], dtype=np.float32)
                 pose = self._map_pose_to_wlasl13(pose_full)
 
+        lh, self._lh_hold = self._stabilize_landmarks(lh, self._last_lh, self._lh_hold)
+        rh, self._rh_hold = self._stabilize_landmarks(rh, self._last_rh, self._rh_hold)
+        pose, self._pose_hold = self._stabilize_landmarks(pose, self._last_pose, self._pose_hold)
+        self._last_lh = lh.copy()
+        self._last_rh = rh.copy()
+        self._last_pose = pose.copy()
+
         feats = self._compose_features(pose, lh, rh)
         return feats, {}
 
@@ -438,8 +484,19 @@ class ASLPredictor:
         if len(self.frame_buffer) == SEQUENCE_LENGTH and self.frame_count % STRIDE == 0:
             seq = np.expand_dims(np.array(self.frame_buffer), axis=0) # (1, 50, 55, 2)
             probs = self._predict_probs(seq)
-            best = int(np.argmax(probs))
+            ranked = np.argsort(probs)[::-1]
+            best = int(ranked[0])
+            second = int(ranked[1]) if probs.shape[0] > 1 else best
             conf = float(probs[best])
-            if conf >= CONFIDENCE:
+            margin = float(probs[best] - probs[second])
+
+            if conf >= CONFIDENCE and margin >= self._min_top1_margin:
+                self._prediction_history.append(best)
+            else:
+                self._prediction_history.append(-1)
+
+            stable_votes = sum(1 for x in self._prediction_history if x == best)
+            if stable_votes >= self._min_consensus:
+                self._prediction_history.clear()
                 return self.labels.get(best, f"word_{best}")
         return None
