@@ -125,7 +125,7 @@ def asl_diagnostics():
     info = {
         "python_version": py_version,
         "recommended_python": "3.11.x",
-        "model_id": "Shawon16/VideoMAE_WLASL_100_SR_8",
+        "model_file": "asl/asl_classifier.pkl",
         "load_predictor_url": f"{request.base_url}?load_predictor=1",
     }
     try:
@@ -139,7 +139,7 @@ def asl_diagnostics():
     else:
         load_predictor = load_predictor_arg.strip().lower() not in {"0", "false", "no"}
     info["predictor_load_requested"] = load_predictor
-    info["backend"] = "videomae"
+    info["backend"] = "sklearn-mediapipe"
 
     if not load_predictor:
         info["predictor_loaded"] = False
@@ -149,8 +149,7 @@ def asl_diagnostics():
     try:
         predictor = get_predictor()
         info["predictor_loaded"] = True
-        info["predictor_backend"] = getattr(predictor, "backend", "unknown")
-        info["feature_dim"] = int(getattr(predictor, "feature_dim", -1))
+        info["predictor_backend"] = "sklearn-mediapipe"
         info["num_classes"] = int(getattr(predictor, "num_classes", -1))
         info["runtime_inference_ok"] = bool(getattr(predictor, "runtime_inference_ok", True))
         info["runtime_issue"] = getattr(predictor, "runtime_issue", "")
@@ -498,21 +497,18 @@ def asl_ws(ws):
     """
     WebSocket endpoint for real-time ASL sign-language translation.
 
-    The client streams JPEG frames (as base64 JSON or raw binary) at ~15fps.
-    The server runs MediaPipe hand-landmark extraction and LSTM inference,
-    then sends back predicted words as JSON messages.
+    The client streams JPEG frames as base64 JSON, server runs sklearn inference
+    on landmark windows, and sends predicted words back to the client.
 
     Query parameters:
         - conversation_id (optional): Firestore conversation ID to persist ASL results.
-        - debug (optional): set to 1 to receive hand-landmark overlays.
-
-    Expected messages from client (JSON):
+    Expected client events:
         - {"event": "asl_frame", "frame": "<base64 JPEG>"}
-        - {"event": "reset"}        — clear frame buffer
-        - {"event": "end"}          — close the session
+        - {"event": "reset"}     # clear predictor buffer
+        - {"event": "end"}       # close session
 
     Server responses (JSON):
-        - {"event": "asl_result", "word": "hello", "confidence": 0.92}
+        - {"event": "asl_result", "word": "hello"}
         - {"event": "connected"}
         - {"event": "error", "message": "..."}
     """
@@ -530,16 +526,15 @@ def asl_ws(ws):
     try:
         predictor = get_predictor()
         logger.info(
-            "[%s] PREDICTOR ready backend=%s feature_dim=%s classes=%s",
+            "[%s] PREDICTOR ready backend=%s classes=%s",
             conn_id,
-            getattr(predictor, "backend", "unknown"),
-            getattr(predictor, "feature_dim", "unknown"),
+            "sklearn-mediapipe",
             getattr(predictor, "num_classes", "unknown"),
         )
         ws.send(json.dumps({
             "event": "asl_status",
             "phase": "ready",
-            "backend": getattr(predictor, "backend", "unknown"),
+            "backend": "sklearn-mediapipe",
         }))
         if not bool(getattr(predictor, "runtime_inference_ok", True)):
             issue = getattr(predictor, "runtime_issue", "ASL runtime check failed")
@@ -556,15 +551,7 @@ def asl_ws(ws):
         ws.send(json.dumps({"event": "error", "message": "Model failed to load"}))
         return
 
-    # Each connection gets its own buffer state — share model, isolate buffers.
-    from asl.predictor import SEQUENCE_LENGTH, STRIDE, CONFIDENCE, HAND_CONNECTIONS
-    from collections import deque
-    import numpy as np
-
-    debug_landmarks = (request.args.get("debug") or "").strip().lower() in {"1", "true", "yes"}
-    debug_landmark_interval = 3
-
-    frame_buffer = deque(maxlen=SEQUENCE_LENGTH)
+    # Shared model, per-connection session state.
     frame_count = 0
     msg_count = 0
     last_idle_log_at = 0.0
@@ -573,7 +560,7 @@ def asl_ws(ws):
     keepalive_interval_sec = 12
     last_frame_at = conn_started_at
     decode_failures = 0
-    infer_windows = 0
+    infer_calls = 0
     predictions_sent = 0
     heartbeat_sent = 0
     heartbeat_recv = 0
@@ -638,135 +625,30 @@ def asl_ws(ws):
                     continue
 
                 frame_bytes = base64.b64decode(frame_b64)
-                np_arr = np.frombuffer(frame_bytes, np.uint8)
-                import cv2
-                frame = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
-                if frame is None:
-                    decode_failures += 1
-                    logger.warning(
-                        "[%s] DECODE failed bytes=%s failures=%s",
-                        conn_id,
-                        len(frame_bytes),
-                        decode_failures,
-                    )
-                    continue
-
-                if debug_landmarks:
-                    keypoints, hand_debug = predictor.extract_features_and_debug(frame)
-                else:
-                    keypoints = predictor._extract_keypoints(frame)
-                    hand_debug = None
-
                 last_frame_at = time.time()
-                frame_buffer.append(keypoints)
                 frame_count += 1
 
-                if debug_landmarks and frame_count % debug_landmark_interval == 0:
-                    ws.send(json.dumps({
-                        "event": "asl_debug_landmarks",
-                        "frame": frame_count,
-                        "hands": hand_debug,
-                        "connections": HAND_CONNECTIONS,
-                    }))
+                try:
+                    word = predictor.process_frame(frame_bytes)
+                except Exception as infer_err:
+                    decode_failures += 1
+                    logger.warning("[%s] process_frame failed: %s", conn_id, infer_err)
+                    continue
 
-                nonzero_keypoints = int(np.count_nonzero(keypoints))
-                if nonzero_keypoints == 0:
-                    zero_keypoint_streak += 1
-                else:
-                    zero_keypoint_streak = 0
-
-                if frame_count % 10 == 0:
-                    logger.info(
-                        "[%s] KEYPOINTS frame=%s nonzero=%s feature_dim=%s",
-                        conn_id,
-                        frame_count,
-                        nonzero_keypoints,
-                        len(keypoints),
-                    )
-
-                if zero_keypoint_streak in (30, 60) or (zero_keypoint_streak > 0 and zero_keypoint_streak % 120 == 0):
-                    logger.warning(
-                        "[%s] NO_HANDS streak=%s frames. MediaPipe sees no landmarks; check camera angle, lighting, and hand visibility.",
-                        conn_id,
-                        zero_keypoint_streak,
-                    )
-
-                if (len(frame_buffer) == SEQUENCE_LENGTH
-                        and frame_count % STRIDE == 0):
-                    infer_windows += 1
-                    seq = np.expand_dims(np.array(frame_buffer), axis=0)
-
-                    # Avoid model invocation on pure-zero windows; these produce unstable outputs.
-                    if not np.any(seq):
-                        logger.warning(
-                            "[%s] INFER skipped: zero-signal window (no landmarks in last %s frames)",
-                            conn_id,
-                            SEQUENCE_LENGTH,
-                        )
-                        continue
-
-                    with predictor._infer_lock:
-                        probs = predictor.model.predict(seq, verbose=0)[0]
-
-                    # Guard against NaN/Inf outputs from edge-case inputs.
-                    if not np.isfinite(probs).all():
-                        logger.warning(
-                            "[%s] INFER invalid_probs nan=%s posinf=%s neginf=%s -> sanitizing",
-                            conn_id,
-                            int(np.isnan(probs).sum()),
-                            int(np.isposinf(probs).sum()),
-                            int(np.isneginf(probs).sum()),
-                        )
-                        probs = np.nan_to_num(probs, nan=0.0, posinf=1.0, neginf=0.0)
-
-                    total_prob = float(np.sum(probs))
-                    if total_prob <= 0.0:
-                        logger.warning("[%s] INFER skipped: probability vector sums to 0.0", conn_id)
-                        continue
-
-                    best = int(np.argmax(probs))
-                    conf = float(probs[best])
-                    best_word = predictor.labels.get(best, f"unknown_{best}")
-                    logger.info(
-                        "[%s] INFER window=%s best=%s conf=%.3f threshold=%.2f",
-                        conn_id,
-                        infer_windows,
-                        best_word,
-                        conf,
-                        CONFIDENCE,
-                    )
-                    if conf >= CONFIDENCE:
-                        word = best_word
-                        predictions_sent += 1
-                        logger.info(
-                            "[%s] TX asl_result word=%s conf=%.3f total_predictions=%s",
-                            conn_id,
-                            word,
-                            conf,
-                            predictions_sent,
-                        )
-                        ws.send(json.dumps({
-                            "event": "asl_result",
-                            "word": word,
-                            "confidence": round(conf, 3),
-                        }))
-                        # Persist to Firestore if a conversation is linked
-                        try:
-                            if conversation_id and db:
-                                db.save_message(
-                                    conversation_id=conversation_id,
-                                    text=word,
-                                    source="asl",
-                                )
-                        except Exception as _db_err:
-                            logger.error("[%s] Firestore save error (asl_result): %s", conn_id, _db_err)
-                    else:
-                        logger.info("[%s] INFER below_threshold conf=%.3f", conn_id, conf)
+                infer_calls += 1
+                if word:
+                    predictions_sent += 1
+                    ws.send(json.dumps({"event": "asl_result", "word": word}))
+                    logger.info("[%s] TX asl_result word=%s total_predictions=%s", conn_id, word, predictions_sent)
+                    try:
+                        if conversation_id and db:
+                            db.save_message(conversation_id=conversation_id, text=word, source="asl")
+                    except Exception as _db_err:
+                        logger.error("[%s] Firestore save error (asl_result): %s", conn_id, _db_err)
 
             elif event == "reset":
-                frame_buffer.clear()
-                frame_count = 0
-                logger.info("[%s] RX reset -> frame_buffer_cleared", conn_id)
+                predictor.reset()
+                logger.info("[%s] RX reset -> predictor_buffer_cleared", conn_id)
 
             elif event in ("pong", "heartbeat"):
                 heartbeat_recv += 1
@@ -784,12 +666,12 @@ def asl_ws(ws):
     finally:
         elapsed = time.time() - conn_started_at
         logger.info(
-            "[%s] CLOSE elapsed=%.1fs messages=%s frames=%s infer_windows=%s predictions=%s decode_failures=%s heartbeats_tx=%s heartbeats_rx=%s",
+            "[%s] CLOSE elapsed=%.1fs messages=%s frames=%s infer_calls=%s predictions=%s decode_failures=%s heartbeats_tx=%s heartbeats_rx=%s",
             conn_id,
             elapsed,
             msg_count,
             frame_count,
-            infer_windows,
+            infer_calls,
             predictions_sent,
             decode_failures,
             heartbeat_sent,
