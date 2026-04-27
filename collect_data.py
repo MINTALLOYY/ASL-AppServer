@@ -37,6 +37,12 @@ def record():
     cap = cv2.VideoCapture(0)
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+    if not cap.isOpened():
+        print("ERROR: Camera could not be opened.")
+        print("Grant camera permission to your Terminal/IDE and retry.")
+        print("macOS: System Settings -> Privacy & Security -> Camera")
+        cap.release()
+        return
 
     for sign in SIGNS:
         sign_dir = os.path.join(OUTPUT_DIR, sign)

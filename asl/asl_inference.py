@@ -1,14 +1,8 @@
-import cv2
-import numpy as np
-import logging
 from typing import Optional, TYPE_CHECKING
 
 if TYPE_CHECKING:
     from asl.predictor import ASLPredictor
 
-logger = logging.getLogger(__name__)
-
-# Module-level predictor instance (lazy-loaded)
 _predictor: Optional["ASLPredictor"] = None
 
 
@@ -22,16 +16,7 @@ def get_predictor() -> "ASLPredictor":
 
 
 def transcribe_video(file_path: str) -> str:
-    """
-    Transcribe an ASL video file to text by extracting frames
-    and running them through the LSTM predictor.
-
-    Args:
-        file_path: Path to the video file (e.g., .mp4).
-
-    Returns:
-        Transcribed text string (space-separated predicted words).
-    """
+    """Transcribe an ASL video file to text using the shared predictor."""
     return transcribe_video_details(file_path).get("text", "")
 
 

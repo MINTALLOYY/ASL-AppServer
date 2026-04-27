@@ -2,7 +2,6 @@ import json
 import os
 import pickle
 
-import mediapipe as mp
 import numpy as np
 from sklearn.ensemble import GradientBoostingClassifier, RandomForestClassifier
 from sklearn.model_selection import cross_val_score
@@ -35,7 +34,16 @@ SIGNS = [
 DATA_DIR = "training_data/raw"
 SEQ_LEN = 50
 
+import mediapipe as mp
+
+if not hasattr(mp, "solutions"):
+    raise RuntimeError(
+        "Invalid mediapipe installation: 'mp.solutions' missing. "
+        "Reinstall with: pip install 'mediapipe==0.10.14' 'protobuf>=4.25.3,<5'"
+    )
+
 mp_holistic = mp.solutions.holistic
+
 holistic = mp_holistic.Holistic(
     static_image_mode=True,
     min_detection_confidence=0.3,

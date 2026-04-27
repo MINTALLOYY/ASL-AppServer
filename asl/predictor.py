@@ -2,7 +2,6 @@ import cv2
 import numpy as np
 import pickle
 import json
-import mediapipe as mp
 import threading
 import logging
 from collections import deque
@@ -10,7 +9,18 @@ from collections import deque
 logger = logging.getLogger(__name__)
 
 SEQ_LEN = 50
+NUM_FRAMES = SEQ_LEN
 CONFIDENCE = 0.55
+
+import mediapipe as mp
+
+if not hasattr(mp, "solutions"):
+    raise RuntimeError(
+        "Invalid mediapipe installation: 'mp.solutions' missing. "
+        "Reinstall with: pip install 'mediapipe==0.10.14' 'protobuf>=4.25.3,<5'"
+    )
+
+MP_HOLISTIC = mp.solutions.holistic
 
 
 class ASLPredictor:
@@ -26,8 +36,7 @@ class ASLPredictor:
             self.labels = {int(k): v for k, v in json.load(f).items()}
         self.num_classes = len(self.labels)
 
-        mp_holistic = mp.solutions.holistic
-        self.holistic = mp_holistic.Holistic(
+        self.holistic = MP_HOLISTIC.Holistic(
             static_image_mode=False,
             min_detection_confidence=0.3,
             min_tracking_confidence=0.3,
@@ -98,6 +107,44 @@ class ASLPredictor:
             for i in ranked
         ]
 
+    def _predict_from_recording(self, rgb_frames: list[np.ndarray], top_k: int = 3) -> dict:
+        """
+        Backward-compatible helper used by test scripts.
+        Accepts RGB frames and returns prediction details.
+        """
+        if not rgb_frames:
+            return {
+                "text": "",
+                "best_prediction": None,
+                "top_predictions": [],
+                "frames_processed": 0,
+                "windows_evaluated": 0,
+                "windows_selected": 0,
+            }
+
+        pre_sample_n = min(len(rgb_frames), 100)
+        if len(rgb_frames) > pre_sample_n:
+            idx = np.linspace(0, len(rgb_frames) - 1, pre_sample_n, dtype=int)
+            sampled = [rgb_frames[i] for i in idx]
+        else:
+            sampled = rgb_frames
+
+        all_lm = np.array([self._extract_landmarks(frame) for frame in sampled], dtype=np.float32)
+        seq = self._select_most_informative_window(all_lm)
+        probs = self._predict_from_seq(seq)
+        top_preds = self._top_predictions(probs, top_k)
+        best = top_preds[0] if top_preds else None
+        text = best["label"] if best and best["confidence"] >= CONFIDENCE else ""
+
+        return {
+            "text": text,
+            "best_prediction": best,
+            "top_predictions": top_preds,
+            "frames_processed": len(rgb_frames),
+            "windows_evaluated": 1,
+            "windows_selected": 1,
+        }
+
     def transcribe_video_file(self, file_path: str, top_k: int = 3) -> dict:
         cap = cv2.VideoCapture(file_path)
         if not cap.isOpened():
@@ -126,28 +173,9 @@ class ASLPredictor:
                 "windows_evaluated": 0,
             }
 
-        pre_sample_n = min(len(raw_frames), 100)
-        if len(raw_frames) > pre_sample_n:
-            idx = np.linspace(0, len(raw_frames) - 1, pre_sample_n, dtype=int)
-            sampled = [raw_frames[i] for i in idx]
-        else:
-            sampled = raw_frames
-
-        all_lm = np.array([self._extract_landmarks(frame) for frame in sampled], dtype=np.float32)
-        seq = self._select_most_informative_window(all_lm)
-
-        probs = self._predict_from_seq(seq)
-        top_preds = self._top_predictions(probs, top_k)
-        best = top_preds[0] if top_preds else None
-        text = best["label"] if best and best["confidence"] >= CONFIDENCE else ""
-
-        return {
-            "text": text,
-            "best_prediction": best,
-            "top_predictions": top_preds,
-            "frames_processed": len(raw_frames),
-            "windows_evaluated": 1,
-        }
+        result = self._predict_from_recording(raw_frames, top_k=top_k)
+        result.pop("windows_selected", None)
+        return result
 
     def process_frame(self, frame_bytes: bytes) -> str | None:
         np_arr = np.frombuffer(frame_bytes, np.uint8)

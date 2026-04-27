@@ -3,8 +3,12 @@ import numpy as np
 from asl.predictor import ASLPredictor, NUM_FRAMES
 
 
-print("Loading VideoMAE (first run downloads model files)...")
-predictor = ASLPredictor()
+print("Loading ASL predictor...")
+try:
+    predictor = ASLPredictor()
+except FileNotFoundError:
+    print("Model file not found: run `python3 train_model.py` first.")
+    raise
 print("Ready. Sign a word, hold for 2 seconds, release. Press Q to quit.")
 
 cap = cv2.VideoCapture(0)
@@ -69,7 +73,7 @@ while cap.isOpened():
             2,
         )
 
-    cv2.imshow("VideoMAE ASL Test", frame)
+    cv2.imshow("ASL Test", frame)
 
 cap.release()
 cv2.destroyAllWindows()
