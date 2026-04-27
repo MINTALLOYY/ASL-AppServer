@@ -1,10 +1,11 @@
 import cv2
 import numpy as np
-from asl.predictor import ASLPredictor, SEQUENCE_LENGTH
+from asl.predictor import ASLPredictor, NUM_FRAMES
 
 def main():
     print("Loading ASL predictor...")
     predictor = ASLPredictor("asl/asl_model.bin", "asl/label_map.json")
+    frame_count = 0
     
     cap = cv2.VideoCapture(0)
     print("Webcam started. Press 'q' to quit. Press 'r' to reset buffer.")
@@ -15,45 +16,26 @@ def main():
             break
             
         h, w, _ = frame.shape
+        frame_count += 1
         
-        # 1. Extract 55 model points in either [0,1] (default) or [-1,1] (legacy toggle)
-        feats, _ = predictor.extract_features_and_debug(frame)
-        
-        # 2. Draw directly what the model receives
-        for i, point in enumerate(feats):
-            if predictor._use_neg1_pos1:
-                if point[0] <= -0.99 and point[1] <= -0.99:
-                    continue
-                # Convert [-1, 1] back to [0, 1] for drawing
-                x_norm = (point[0] + 1.0) / 2.0
-                y_norm = (point[1] + 1.0) / 2.0
-            else:
-                # In [0,1] mode, missing keypoints are (0,0) and valid keypoints are clamped to screen.
-                x_norm = float(np.clip(point[0], 0.0, 1.0))
-                y_norm = float(np.clip(point[1], 0.0, 1.0))
-            
-            x = int(x_norm * w)
-            y = int(y_norm * h)
-            
-            # Color code points for clarity
-            if i < 13: # Pose Keypoints (Green)
-                color = (0, 255, 0) 
-            elif i < 13 + 21: # Left Hand (Blue)
-                color = (255, 0, 0)
-            else: # Right Hand (Red)
-                color = (0, 0, 255)
-                
-            if 0 <= x < w and 0 <= y < h:
-                cv2.circle(frame, (x, y), 4, color, -1)
+        # 1. Add RGB frame to rolling clip buffer
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        predictor.frame_buffer.append(rgb)
 
-        # 3. Add to the rolling buffer for the sliding window
-        predictor.frame_buffer.append(feats)
-
-        # 4. If we have 50 frames, check prediction!
-        if len(predictor.frame_buffer) == SEQUENCE_LENGTH:
-            seq = np.stack(predictor.frame_buffer)[np.newaxis, ...]
-            probs = predictor._predict_probs(seq)
-            preds = predictor._top_predictions(probs, top_k=3)
+        # 2. If we have enough frames, run rolling clip prediction
+        if len(predictor.frame_buffer) >= NUM_FRAMES and frame_count % 4 == 0:
+            recent = predictor.frame_buffer[-48:]
+            result = predictor._predict_from_recording(recent, top_k=3)
+            preds = result.get("top_predictions", [])
+            if frame_count % 20 == 0:
+                print(
+                    "Debug:",
+                    f"buffer={len(predictor.frame_buffer)}",
+                    f"windows={result.get('windows_evaluated', 0)}",
+                    f"selected={result.get('windows_selected', 0)}",
+                    f"best={preds[0]['label'] if preds else 'n/a'}",
+                    f"conf={preds[0]['confidence'] if preds else 0:.4f}",
+                )
             
             if preds:
                 best = preds[0]
@@ -66,9 +48,9 @@ def main():
                 subtext = f"Also: {preds[1]['label']} ({preds[1]['confidence']:.2f}), {preds[2]['label']} ({preds[2]['confidence']:.2f})"
                 cv2.putText(frame, subtext, (10, 75), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 2)
         else:
-            cv2.putText(frame, f"Warming up... {len(predictor.frame_buffer)}/{SEQUENCE_LENGTH}", (10, 40), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
+            cv2.putText(frame, f"Warming up... {len(predictor.frame_buffer)}/{NUM_FRAMES}", (10, 40), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
             
-        cv2.imshow("ASL Zero-Depth 55-Point Skeleton", frame)
+        cv2.imshow("ASL VideoMAE Debug", frame)
         
         key = cv2.waitKey(1) & 0xFF
         if key == ord('q'):

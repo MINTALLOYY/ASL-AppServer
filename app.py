@@ -125,8 +125,7 @@ def asl_diagnostics():
     info = {
         "python_version": py_version,
         "recommended_python": "3.11.x",
-        "model_path": os.path.join(os.path.dirname(__file__), "asl", "asl_model.keras"),
-        "labels_path": os.path.join(os.path.dirname(__file__), "asl", "label_map.json"),
+        "model_id": "Shawon16/VideoMAE_WLASL_100_SR_8",
         "load_predictor_url": f"{request.base_url}?load_predictor=1",
     }
     try:
@@ -140,13 +139,7 @@ def asl_diagnostics():
     else:
         load_predictor = load_predictor_arg.strip().lower() not in {"0", "false", "no"}
     info["predictor_load_requested"] = load_predictor
-    try:
-        import mediapipe as mp
-
-        info["mediapipe_version"] = getattr(mp, "__version__", "unknown")
-        info["mediapipe_has_solutions"] = hasattr(mp, "solutions")
-    except Exception as e:
-        info["mediapipe_import_error"] = str(e)
+    info["backend"] = "videomae"
 
     if not load_predictor:
         info["predictor_loaded"] = False

@@ -17,12 +17,7 @@ def get_predictor() -> "ASLPredictor":
     global _predictor
     if _predictor is None:
         from asl.predictor import ASLPredictor
-        import os
-        base = os.path.dirname(__file__)
-        _predictor = ASLPredictor(
-            model_path=os.path.join(base, "asl_model.bin"),
-            labels_path=os.path.join(base, "label_map.json"),
-        )
+        _predictor = ASLPredictor()
     return _predictor
 
 

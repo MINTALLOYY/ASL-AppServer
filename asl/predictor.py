@@ -1,502 +1,294 @@
 import cv2
-import json
-import os
 import numpy as np
-import mediapipe as mp
-import platform
-import tempfile
-import threading
-import urllib.request
-from collections import deque
-import logging
 import torch
-import torch.nn as nn
-from torch.nn.parameter import Parameter
-import math
-from huggingface_hub import hf_hub_download
+import threading
+import logging
+import os
+from collections import deque
+from transformers import VideoMAEForVideoClassification, VideoMAEImageProcessor
 
 logger = logging.getLogger(__name__)
 
-SEQUENCE_LENGTH = 50   # frames per inference window (from config: NUM_SAMPLES = 50)
-STRIDE          = 15   # run inference every N frames
-CONFIDENCE      = 0.85  # min confidence to emit a prediction
-
-class GraphConvolution_att(nn.Module):
-    def __init__(self, in_features, out_features, bias=True, init_A=0):
-        super(GraphConvolution_att, self).__init__()
-        self.in_features = in_features
-        self.out_features = out_features
-        self.weight = Parameter(torch.FloatTensor(in_features, out_features))
-        self.att = Parameter(torch.FloatTensor(55, 55))
-        if bias:
-            self.bias = Parameter(torch.FloatTensor(out_features))
-        else:
-            self.register_parameter('bias', None)
-        self.reset_parameters()
-
-    def reset_parameters(self):
-        stdv = 1. / math.sqrt(self.weight.size(1))
-        self.weight.data.uniform_(-stdv, stdv)
-        self.att.data.uniform_(-stdv, stdv)
-        if self.bias is not None:
-            self.bias.data.uniform_(-stdv, stdv)
-
-    def forward(self, input):
-        support = torch.matmul(input, self.weight)  # HW
-        output = torch.matmul(self.att, support)  # g
-        if self.bias is not None:
-            return output + self.bias
-        else:
-            return output
-
-class GC_Block(nn.Module):
-    def __init__(self, in_features, p_dropout, bias=True, is_resi=True):
-        super(GC_Block, self).__init__()
-        self.in_features = in_features
-        self.out_features = in_features
-        self.is_resi = is_resi
-
-        self.gc1 = GraphConvolution_att(in_features, in_features)
-        self.bn1 = nn.BatchNorm1d(55 * in_features)
-
-        self.gc2 = GraphConvolution_att(in_features, in_features)
-        self.bn2 = nn.BatchNorm1d(55 * in_features)
-
-        self.do = nn.Dropout(p_dropout)
-        self.act_f = nn.Tanh()
-
-    def forward(self, x):
-        y = self.gc1(x)
-        b, n, f = y.shape
-        y = self.bn1(y.view(b, -1)).view(b, n, f)
-        y = self.act_f(y)
-        y = self.do(y)
-
-        y = self.gc2(y)
-        b, n, f = y.shape
-        y = self.bn2(y.view(b, -1)).view(b, n, f)
-        y = self.act_f(y)
-        y = self.do(y)
-        if self.is_resi:
-            return y + x
-        else:
-            return y
-
-class GCN_muti_att(nn.Module):
-    def __init__(self, input_feature, hidden_feature, num_class, p_dropout, num_stage=1, is_resi=True):
-        super(GCN_muti_att, self).__init__()
-        self.num_stage = num_stage
-
-        self.gc1 = GraphConvolution_att(input_feature, hidden_feature)
-        self.bn1 = nn.BatchNorm1d(55 * hidden_feature)
-
-        self.gcbs = []
-        for i in range(num_stage):
-            self.gcbs.append(GC_Block(hidden_feature, p_dropout=p_dropout, is_resi=is_resi))
-
-        self.gcbs = nn.ModuleList(self.gcbs)
-
-        self.do = nn.Dropout(p_dropout)
-        self.act_f = nn.Tanh()
-
-        self.fc_out = nn.Linear(hidden_feature, num_class)
-
-    def forward(self, x):
-        y = self.gc1(x)
-        b, n, f = y.shape
-        y = self.bn1(y.view(b, -1)).view(b, n, f)
-        y = self.act_f(y)
-        y = self.do(y)
-
-        for i in range(self.num_stage):
-            y = self.gcbs[i](y)
-
-        out = torch.mean(y, dim=1)
-        out = self.fc_out(out)
-        return out
+NUM_FRAMES = 16
+SEQUENCE_LENGTH = NUM_FRAMES
+CONFIDENCE = 0.45
+WINDOW_STRIDE = 8
+LIVE_BUFFER_MAX = 64
+LIVE_STRIDE = 4
+LIVE_CONSENSUS = 2
 
 
 class ASLPredictor:
-    def __init__(self, model_path: str, labels_path: str):
-        logger.info("Initializing ASL PyTorch TGCN model from WLASL-100 configuration...")
-        
-        self.device = torch.device('cuda' if torch.cuda.is_available() else 'mps' if torch.backends.mps.is_available() else 'cpu')
-        self.model_path = model_path
-        
-        if not os.path.exists(self.model_path):
-            logger.warning(f"Local checkpoint {self.model_path} not found. Attempting download from HF...")
-            try:
-                self.model_path = hf_hub_download('sharonn18/tgcn-wlasl', 'checkpoints/asl100/pytorch_model.bin')
-            except Exception as e:
-                logger.error(f"HF download failed: {e}")
-            
-        # TGCN config for asl100
-        self.num_samples = 50
-        self.hidden_size = 64
-        self.num_stages = 20
-        self.drop_p = 0.3
-        self.input_feature = self.num_samples * 2 # 100
-        self.num_classes = 100
-        
-        self.model = GCN_muti_att(
-            input_feature=self.input_feature, 
-            hidden_feature=self.hidden_size,
-            num_class=self.num_classes, 
-            p_dropout=self.drop_p, 
-            num_stage=self.num_stages
+    def __init__(self, model_path: str | None = None, labels_path: str | None = None):
+        # Keep args for compatibility with older call sites.
+        del model_path
+        del labels_path
+
+        self.device = (
+            torch.device("mps") if torch.backends.mps.is_available()
+            else torch.device("cuda") if torch.cuda.is_available()
+            else torch.device("cpu")
         )
-        
-        try:
-            state_dict = torch.load(self.model_path, map_location=self.device)
-            # if weights are wrapped
-            if 'state_dict' in state_dict:
-                state_dict = state_dict['state_dict']
-            self.model.load_state_dict(state_dict, strict=False)
-            self.model.to(self.device)
-            self.model.eval()
-            self.runtime_inference_ok = True
-            self.runtime_issue = ""
-            logger.info("Successfully loaded PyTorch TGCN model.")
-        except Exception as exc:
-            self.runtime_inference_ok = False
-            self.runtime_issue = f"Failed to load PyTorch stats: {exc}"
-            logger.error(self.runtime_issue)
+        logger.info("ASL device: %s", self.device)
 
-        # Build labels - try to load local labels, fallback to indices if fail
-        with open(labels_path, "r") as f:
-            label_map = json.load(f)
-        self.labels = {int(k): v for k, v in label_map.items()}
+        model_id = "Shawon16/VideoMAE_WLASL_100_SR_8"
+        logger.info("Loading VideoMAE from %s ...", model_id)
 
-        self._backend = "holistic"
-        self._tasks_image_cls = None
-        self._tasks_image_format = None
-        self._tasks_hand = None
-        self._tasks_pose = None
-        self.feature_dim = 225
+        self.processor = VideoMAEImageProcessor.from_pretrained(model_id)
+        self.model = VideoMAEForVideoClassification.from_pretrained(model_id)
+        self.model.to(self.device)
+        self.model.eval()
 
-        try:
-            holistic_cls = mp.solutions.holistic.Holistic
-        except AttributeError:
-            try:
-                from mediapipe.python.solutions import holistic as mp_holistic
-                holistic_cls = mp_holistic.Holistic
-            except Exception as exc:
-                self._init_tasks_backend()
-                holistic_cls = None
+        raw_labels = getattr(self.model.config, "id2label", {}) or {}
+        self.labels = {int(k): v for k, v in raw_labels.items()}
+        self.num_classes = len(self.labels)
+        logger.info(
+            "VideoMAE loaded. %d classes. First 3: %s",
+            self.num_classes,
+            [self.labels.get(i, f"word_{i}") for i in range(min(3, self.num_classes))],
+        )
+        logger.info(
+            "ASL inference params: num_frames=%d confidence=%.2f window_stride=%d live_buffer_max=%d live_stride=%d live_consensus=%d",
+            NUM_FRAMES,
+            CONFIDENCE,
+            WINDOW_STRIDE,
+            LIVE_BUFFER_MAX,
+            LIVE_STRIDE,
+            LIVE_CONSENSUS,
+        )
 
-        if holistic_cls is not None:
-            self.holistic = holistic_cls(
-                min_detection_confidence=0.5,
-                min_tracking_confidence=0.5,
-            )
-        else:
-            self.holistic = None
-        self.frame_buffer = deque(maxlen=SEQUENCE_LENGTH)
-        self.frame_count = 0
-        self._prediction_history = deque(maxlen=5)
-        self._landmark_hold_frames = int(os.getenv("ASL_LANDMARK_HOLD_FRAMES", "6"))
-        self._min_consensus = int(os.getenv("ASL_MIN_PREDICTION_CONSENSUS", "3"))
-        self._min_top1_margin = float(os.getenv("ASL_MIN_TOP1_MARGIN", "0.12"))
-        self._use_neg1_pos1 = os.getenv("ASL_USE_NEG1_POS1", "0") == "1"
-        self._last_lh = np.zeros((21, 2), dtype=np.float32)
-        self._last_rh = np.zeros((21, 2), dtype=np.float32)
-        self._last_pose = np.zeros((13, 2), dtype=np.float32)
-        self._lh_hold = 0
-        self._rh_hold = 0
-        self._pose_hold = 0
-        self._infer_lock = threading.Lock()
+        if os.getenv("ASL_SKIP_SANITY_PROBE", "0") != "1":
+            self._run_sanity_probe()
+
+        self.frame_buffer: list[np.ndarray] = []
+        self._live_history = deque(maxlen=5)
+        self._lock = threading.Lock()
+        self.runtime_inference_ok = True
+        self.runtime_issue = ""
 
     def reset(self) -> None:
-        """Clear the internal frame buffer and reset counters for a new sequence."""
-        with self._infer_lock:
-            self.frame_buffer.clear()
-            self.frame_count = 0
-            self._prediction_history.clear()
-            self._last_lh.fill(0)
-            self._last_rh.fill(0)
-            self._last_pose.fill(0)
-            self._lh_hold = 0
-            self._rh_hold = 0
-            self._pose_hold = 0
-            logger.info("ASLPredictor state reset.")
+        with self._lock:
+            self.frame_buffer = []
 
-    def _stabilize_landmarks(
-        self,
-        current: np.ndarray,
-        last: np.ndarray,
-        hold_counter: int,
-    ) -> tuple[np.ndarray, int]:
-        # MediaPipe can drop landmarks for a few frames. Reuse recent coordinates briefly to avoid
-        # injecting sudden (-1, -1) spikes into the temporal sequence.
-        if np.any(current):
-            return current, self._landmark_hold_frames
-        if hold_counter > 0 and np.any(last):
-            return last.copy(), hold_counter - 1
-        return current, 0
-
-    def _predict_probs(self, seq: np.ndarray) -> np.ndarray:
-        if not self.runtime_inference_ok:
-            raise RuntimeError(self.runtime_issue or "ASL model runtime is not healthy")
-        
-        # seq is (1, 50, 55, 2)
-        if seq.ndim != 4:
-            raise ValueError(f"Expected seq rank 4, got {seq.shape}")
-        
-        # TGCN expects: (batch, num_nodes=55, num_features=100)
-        # where 100 is 50 frames * 2 (x,y)
-        batch = seq.shape[0]
-        # (batch, seq_len, 55, 2) -> (batch, 55, seq_len * 2)
-        seq_trans = np.transpose(seq, (0, 2, 1, 3))
-        seq_flat = seq_trans.reshape(batch, 55, self.num_samples * 2)
-
-        tensor_seq = torch.FloatTensor(seq_flat).to(self.device)
-        with self._infer_lock:
-            with torch.no_grad():
-                out = self.model(tensor_seq)
-                probs = torch.softmax(out, dim=-1).cpu().numpy()[0]
-
+    def _predict_from_frames(self, frames: list[np.ndarray]) -> np.ndarray:
+        """
+        frames: list of NUM_FRAMES numpy arrays, each (H, W, 3) RGB uint8.
+        Returns softmax probability vector of length num_classes.
+        """
+        inputs = self.processor(frames, return_tensors="pt")
+        inputs = {k: v.to(self.device) for k, v in inputs.items()}
+        with torch.no_grad():
+            out = self.model(**inputs)
+            probs = torch.softmax(out.logits, dim=-1).cpu().numpy()[0]
         return probs
 
-    def _top_predictions(self, probs: np.ndarray, top_k: int = 3) -> list[dict]:
-        if probs.size == 0:
+    def _sample_frames(self, all_frames: list[np.ndarray], n: int = NUM_FRAMES) -> list[np.ndarray]:
+        """Uniformly sample n frames from a list."""
+        if len(all_frames) == 0:
             return []
-        top_k = max(1, min(int(top_k), int(probs.shape[0])))
+        indices = np.linspace(0, len(all_frames) - 1, n, dtype=int)
+        return [all_frames[i] for i in indices]
+
+    def _top_predictions(self, probs: np.ndarray, top_k: int = 3) -> list[dict]:
+        top_k = min(top_k, len(probs))
         ranked = np.argsort(probs)[::-1][:top_k]
-        results = []
-        for idx in ranked:
-            results.append(
-                {
-                    "index": int(idx),
-                    "label": self.labels.get(int(idx), f"word_{int(idx)}"),
-                    "confidence": round(float(probs[idx]), 4),
-                }
-            )
-        return results
+        return [
+            {
+                "index": int(i),
+                "label": self.labels.get(int(i), f"word_{i}"),
+                "confidence": round(float(probs[i]), 4),
+            }
+            for i in ranked
+        ]
 
-    def predict_sequence(self, seq: np.ndarray, top_k: int = 3) -> dict:
-        probs = self._predict_probs(seq)
-        top_predictions = self._top_predictions(probs, top_k=top_k)
-        best = top_predictions[0] if top_predictions else None
-        return {
-            "best_prediction": best,
-            "top_predictions": top_predictions,
-        }
+    def _log_top_predictions(self, probs: np.ndarray, context: str, top_k: int = 3) -> None:
+        preds = self._top_predictions(probs, top_k=top_k)
+        if not preds:
+            logger.info("[%s] no predictions", context)
+            return
+        logger.info(
+            "[%s] top%d: %s",
+            context,
+            len(preds),
+            ", ".join(f"{p['label']}={p['confidence']:.4f}" for p in preds),
+        )
 
-    def transcribe_video_file(self, file_path: str, top_k: int = 3) -> dict:
-        cap = cv2.VideoCapture(file_path)
-        if not cap.isOpened():
-            return {"text": "", "best_prediction": None, "top_predictions": []}
-
-        frame_features = []
+    def _run_sanity_probe(self) -> None:
+        """Quick startup probe to detect collapsed checkpoints early."""
         try:
-            while True:
-                ret, frame = cap.read()
-                if not ret:
-                    break
-                frame_features.append(self._extract_keypoints(frame))
-        finally:
-            cap.release()
+            black = [np.zeros((224, 224, 3), dtype=np.uint8) for _ in range(NUM_FRAMES)]
+            probs_black = self._predict_from_frames(black)
+            black_idx = int(np.argmax(probs_black))
+            black_conf = float(probs_black[black_idx])
+            black_label = self.labels.get(black_idx, f"word_{black_idx}")
 
-        if not frame_features:
-            return {"text": "", "best_prediction": None, "top_predictions": []}
+            random_top = []
+            for _ in range(5):
+                frames = [np.random.randint(0, 256, (224, 224, 3), dtype=np.uint8) for _ in range(NUM_FRAMES)]
+                probs = self._predict_from_frames(frames)
+                random_top.append(int(np.argmax(probs)))
 
-        if len(frame_features) < SEQUENCE_LENGTH:
-            last = frame_features[-1]
-            frame_features.extend([last] * (SEQUENCE_LENGTH - len(frame_features)))
+            values, counts = np.unique(np.array(random_top), return_counts=True)
+            dominant = int(values[np.argmax(counts)])
+            dominant_ratio = float(np.max(counts) / len(random_top))
+            dominant_label = self.labels.get(dominant, f"word_{dominant}")
 
-        windows = []
-        for start in range(0, len(frame_features) - SEQUENCE_LENGTH + 1, STRIDE):
-            windows.append(np.stack(frame_features[start : start + SEQUENCE_LENGTH]))
+            logger.info(
+                "[sanity] black_top=%s conf=%.4f random_dominant=%s ratio=%.2f",
+                black_label,
+                black_conf,
+                dominant_label,
+                dominant_ratio,
+            )
 
-        if not windows:
-            windows.append(np.stack(frame_features[-SEQUENCE_LENGTH:]))
+            # Heuristic: very high confidence on blank clip + high random dominance indicates collapse.
+            if black_conf > 0.80 and dominant_ratio >= 0.80:
+                logger.warning(
+                    "[sanity] model appears collapsed: high-confidence blank prediction and random-input dominance detected. "
+                    "Expected behavior is low confidence / diverse outputs on non-sign inputs."
+                )
+        except Exception as exc:
+            logger.warning("[sanity] startup probe failed: %s", exc)
 
-        accum_probs = None
-        for w in windows:
-            probs = self._predict_probs(w[np.newaxis, ...])
-            if accum_probs is None:
-                accum_probs = np.zeros_like(probs)
-            accum_probs += probs
+    def _predict_from_recording(self, rgb_frames: list[np.ndarray], top_k: int = 3) -> dict:
+        """Score a full recording by sliding 16-frame windows and aggregating strongest windows."""
+        if not rgb_frames:
+            return {
+                "text": "",
+                "best_prediction": None,
+                "top_predictions": [],
+                "frames_processed": 0,
+                "windows_evaluated": 0,
+                "windows_selected": 0,
+            }
 
-        avg = accum_probs / len(windows)
-        top_preds = self._top_predictions(avg, top_k)
+        windows: list[list[np.ndarray]] = []
+        if len(rgb_frames) <= NUM_FRAMES:
+            windows.append(self._sample_frames(rgb_frames, NUM_FRAMES))
+        else:
+            for start in range(0, len(rgb_frames) - NUM_FRAMES + 1, WINDOW_STRIDE):
+                windows.append(rgb_frames[start : start + NUM_FRAMES])
+            if not windows:
+                windows.append(self._sample_frames(rgb_frames, NUM_FRAMES))
+
+        logger.info(
+            "[recording] frames=%d windows=%d stride=%d",
+            len(rgb_frames),
+            len(windows),
+            WINDOW_STRIDE,
+        )
+
+        scored: list[tuple[float, np.ndarray]] = []
+        for clip in windows:
+            probs = self._predict_from_frames(clip)
+            scored.append((float(np.max(probs)), probs))
+
+        scored.sort(key=lambda x: x[0], reverse=True)
+        keep = max(1, len(scored) // 2)
+        selected = scored[:keep]
+
+        logger.info(
+            "[recording] selected_windows=%d best_window_conf=%.4f",
+            len(selected),
+            selected[0][0] if selected else 0.0,
+        )
+
+        accum = np.zeros((self.num_classes,), dtype=np.float32)
+        for _, probs in selected:
+            accum += probs
+        final_probs = accum / float(len(selected))
+
+        top_preds = self._top_predictions(final_probs, top_k)
         best = top_preds[0] if top_preds else None
-        
-        text = ""
-        if best and best["confidence"] >= CONFIDENCE:
-            text = best["label"]
+        text = best["label"] if best and best["confidence"] >= CONFIDENCE else ""
+        self._log_top_predictions(final_probs, context="recording_aggregated", top_k=3)
 
         return {
             "text": text,
             "best_prediction": best,
             "top_predictions": top_preds,
-            "frames_processed": len(frame_features),
+            "frames_processed": len(rgb_frames),
             "windows_evaluated": len(windows),
+            "windows_selected": len(selected),
         }
 
-    @property
-    def backend(self) -> str:
-        return self._backend
+    def transcribe_video_file(self, file_path: str, top_k: int = 3) -> dict:
+        """Main entry point — takes a video file path, returns prediction dict."""
+        cap = cv2.VideoCapture(file_path)
+        if not cap.isOpened():
+            return {
+                "text": "",
+                "best_prediction": None,
+                "top_predictions": [],
+                "frames_processed": 0,
+                "windows_evaluated": 0,
+            }
 
-    def _init_tasks_backend(self) -> None:
-        from mediapipe.tasks import python as mp_tasks_python
-        from mediapipe.tasks.python import vision as mp_tasks_vision
+        raw_frames = []
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
+            raw_frames.append(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+        cap.release()
 
-        model_dir = os.path.join(tempfile.gettempdir(), "asl_mediapipe_models")
-        os.makedirs(model_dir, exist_ok=True)
-        hand_model_path = os.path.join(model_dir, "hand_landmarker.task")
-        if not os.path.exists(hand_model_path):
-            urllib.request.urlretrieve("https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task", hand_model_path)
-            
-        pose_model_path = os.path.join(model_dir, "pose_landmarker_lite.task")
-        if not os.path.exists(pose_model_path):
-            urllib.request.urlretrieve("https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task", pose_model_path)
+        if not raw_frames:
+            return {
+                "text": "",
+                "best_prediction": None,
+                "top_predictions": [],
+                "frames_processed": 0,
+                "windows_evaluated": 0,
+            }
 
-        self._tasks_hand = mp_tasks_vision.HandLandmarker.create_from_options(
-            mp_tasks_vision.HandLandmarkerOptions(
-                base_options=mp_tasks_python.BaseOptions(model_asset_path=hand_model_path),
-                running_mode=mp_tasks_vision.RunningMode.IMAGE,
-                num_hands=2,
-            )
-        )
-        self._tasks_pose = mp_tasks_vision.PoseLandmarker.create_from_options(
-            mp_tasks_vision.PoseLandmarkerOptions(
-                base_options=mp_tasks_python.BaseOptions(model_asset_path=pose_model_path),
-                running_mode=mp_tasks_vision.RunningMode.IMAGE,
-            )
-        )
-        self._tasks_image_cls = mp.Image
-        self._tasks_image_format = mp.ImageFormat.SRGB
-        self._backend = "tasks"
-
-    def _extract_keypoints(self, frame_bgr: np.ndarray) -> np.ndarray:
-        feats, _ = self.extract_features_and_debug(frame_bgr)
-        return feats
-
-    def _map_pose_to_wlasl13(self, p: np.ndarray) -> np.ndarray:
-        if p.shape[0] < 33:
-            return np.zeros((13, 2), dtype=np.float32)
-        return np.array([
-            p[0],                # 0: Nose
-            (p[11] + p[12]) / 2, # 1: Neck
-            p[12],               # 2: R Shoulder
-            p[14],               # 3: R Elbow
-            p[16],               # 4: R Wrist
-            p[11],               # 5: L Shoulder
-            p[13],               # 6: L Elbow
-            p[15],               # 7: L Wrist
-            (p[23] + p[24]) / 2, # 8: MidHip
-            p[5],                # 9: R Eye
-            p[2],                # 10: L Eye
-            p[8],                # 11: R Ear
-            p[7],                # 12: L Ear
-        ], dtype=np.float32)
-
-    def extract_features_and_debug(self, frame_bgr: np.ndarray) -> tuple[np.ndarray, dict]:
-        with self._infer_lock:
-            rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-            if self._backend == "tasks":
-                return self._extract_keypoints_tasks_with_debug(rgb)
-
-            results = self.holistic.process(rgb)
-
-        def lm_array(lm_list, n):
-            if lm_list:
-                return np.array([[l.x, l.y] for l in lm_list.landmark], dtype=np.float32)
-            return np.zeros((n, 2), dtype=np.float32)
-
-        pose_full = lm_array(results.pose_landmarks, 33)
-        pose = self._map_pose_to_wlasl13(pose_full)
-        lh = lm_array(results.left_hand_landmarks, 21)
-        rh = lm_array(results.right_hand_landmarks, 21)
-
-        lh, self._lh_hold = self._stabilize_landmarks(lh, self._last_lh, self._lh_hold)
-        rh, self._rh_hold = self._stabilize_landmarks(rh, self._last_rh, self._rh_hold)
-        pose, self._pose_hold = self._stabilize_landmarks(pose, self._last_pose, self._pose_hold)
-        self._last_lh = lh.copy()
-        self._last_rh = rh.copy()
-        self._last_pose = pose.copy()
-
-        feats = self._compose_features(pose, lh, rh)
-        return feats, {}
-
-    def _compose_features(self, pose: np.ndarray, lh: np.ndarray, rh: np.ndarray) -> np.ndarray:
-        # Expected TGCN joints: 55 = 13 pose + 21 lh + 21 rh
-        raw = np.concatenate([pose, lh, rh], axis=0) # (55, 2)
-        if raw.shape[0] < 55:
-            raw = np.pad(raw, ((0, 55 - raw.shape[0]), (0, 0)), mode="constant")
-        raw = raw[:55]
-
-        # Keep MediaPipe coordinates in [0, 1] by default.
-        # Optional fallback: ASL_USE_NEG1_POS1=1 for legacy experiments.
-        if self._use_neg1_pos1:
-            raw = 2.0 * raw - 1.0
-        
-        return raw.astype(np.float32)
-
-    def _extract_keypoints_tasks_with_debug(self, frame_rgb: np.ndarray) -> tuple[np.ndarray, dict]:
-        image = self._tasks_image_cls(image_format=self._tasks_image_format, data=frame_rgb)
-        hand_result = self._tasks_hand.detect(image)
-
-        lh = np.zeros((21, 2), dtype=np.float32)
-        rh = np.zeros((21, 2), dtype=np.float32)
-
-        for idx, landmarks in enumerate(hand_result.hand_landmarks):
-            coords = np.array([[lm.x, lm.y] for lm in landmarks], dtype=np.float32)
-            try:
-                hand_name = (hand_result.handedness[idx][0].category_name or "").lower()
-            except:
-                hand_name = ""
-            
-            # Explicitly assign to the correct hand instead of overwriting based on emptiness
-            if hand_name == "left":
-                lh = coords
-            elif hand_name == "right":
-                rh = coords
-
-        pose = np.zeros((13, 2), dtype=np.float32)
-        if self._tasks_pose is not None:
-            pose_result = self._tasks_pose.detect(image)
-            if pose_result.pose_landmarks:
-                pose_full = np.array([[lm.x, lm.y] for lm in pose_result.pose_landmarks[0]], dtype=np.float32)
-                pose = self._map_pose_to_wlasl13(pose_full)
-
-        lh, self._lh_hold = self._stabilize_landmarks(lh, self._last_lh, self._lh_hold)
-        rh, self._rh_hold = self._stabilize_landmarks(rh, self._last_rh, self._rh_hold)
-        pose, self._pose_hold = self._stabilize_landmarks(pose, self._last_pose, self._pose_hold)
-        self._last_lh = lh.copy()
-        self._last_rh = rh.copy()
-        self._last_pose = pose.copy()
-
-        feats = self._compose_features(pose, lh, rh)
-        return feats, {}
+        return self._predict_from_recording(raw_frames, top_k=top_k)
 
     def process_frame(self, frame_bytes: bytes) -> str | None:
+        """
+        Live streaming path — feed JPEG frames one at a time.
+        Returns a word string when buffer hits NUM_FRAMES, else None.
+        """
         np_arr = np.frombuffer(frame_bytes, np.uint8)
         frame = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
         if frame is None:
             return None
 
-        keypoints = self._extract_keypoints(frame)
-        self.frame_buffer.append(keypoints)
-        self.frame_count += 1
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        with self._lock:
+            self.frame_buffer.append(rgb)
+            if len(self.frame_buffer) > LIVE_BUFFER_MAX:
+                self.frame_buffer = self.frame_buffer[-LIVE_BUFFER_MAX:]
 
-        if len(self.frame_buffer) == SEQUENCE_LENGTH and self.frame_count % STRIDE == 0:
-            seq = np.expand_dims(np.array(self.frame_buffer), axis=0) # (1, 50, 55, 2)
-            probs = self._predict_probs(seq)
-            ranked = np.argsort(probs)[::-1]
-            best = int(ranked[0])
-            second = int(ranked[1]) if probs.shape[0] > 1 else best
-            conf = float(probs[best])
-            margin = float(probs[best] - probs[second])
+            if len(self.frame_buffer) < NUM_FRAMES:
+                return None
 
-            if conf >= CONFIDENCE and margin >= self._min_top1_margin:
-                self._prediction_history.append(best)
-            else:
-                self._prediction_history.append(-1)
+            if len(self.frame_buffer) % LIVE_STRIDE != 0:
+                return None
 
-            stable_votes = sum(1 for x in self._prediction_history if x == best)
-            if stable_votes >= self._min_consensus:
-                self._prediction_history.clear()
-                return self.labels.get(best, f"word_{best}")
+            frames = self.frame_buffer[-NUM_FRAMES:]
+
+        probs = self._predict_from_frames(frames)
+        best_idx = int(np.argmax(probs))
+        conf = float(probs[best_idx])
+        best_label = self.labels.get(best_idx, f"word_{best_idx}")
+
+        if conf >= CONFIDENCE:
+            self._live_history.append(best_idx)
+        else:
+            self._live_history.append(-1)
+
+        votes = sum(1 for idx in self._live_history if idx == best_idx)
+        logger.info(
+            "[live] buffer=%d best=%s conf=%.4f votes=%d/%d threshold=%.2f",
+            len(self.frame_buffer),
+            best_label,
+            conf,
+            votes,
+            LIVE_CONSENSUS,
+            CONFIDENCE,
+        )
+        if conf >= CONFIDENCE and votes >= LIVE_CONSENSUS:
+            self._live_history.clear()
+            self._log_top_predictions(probs, context="live_emit", top_k=3)
+            return best_label
         return None
