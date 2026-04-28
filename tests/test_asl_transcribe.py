@@ -37,6 +37,7 @@ class TestAslTranscribeRoute(unittest.TestCase):
             "top_predictions": [
                 {"index": 113, "label": "hello", "confidence": 0.9723},
                 {"index": 214, "label": "thankyou", "confidence": 0.0151},
+                {"index": 7, "label": "yes", "confidence": 0.0092},
             ],
             "frames_processed": 42,
             "windows_evaluated": 3,
@@ -54,7 +55,9 @@ class TestAslTranscribeRoute(unittest.TestCase):
         body = resp.get_json()
         self.assertEqual(body["text"], "hello")
         self.assertEqual(body["best_prediction"]["label"], "hello")
-        self.assertEqual(len(body["top_predictions"]), 2)
+        self.assertEqual(len(body["top_predictions"]), 3)
+        self.assertEqual(len(body["predictions"]), 3)
+        self.assertEqual(body["predictions"][0]["word"], "hello")
         self.assertEqual(body["frames_processed"], 42)
         self.assertEqual(body["windows_evaluated"], 3)
         self.mock_db.save_message.assert_called_once_with(
