@@ -18,6 +18,7 @@ from firebase.db import FirestoreDB
 from speech.chirp_stream import ChirpStreamer, speaker_label_from_result
 
 from asl.asl_inference import transcribe_video_details, get_predictor
+from flask_cors import CORS
 
 load_dotenv()
 
@@ -51,6 +52,7 @@ logger.info(
 
 app = Flask(__name__)
 sock = Sock(app)
+CORS(app)
 
 creds = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS")
 creds_project_id = None
@@ -464,7 +466,7 @@ def asl_transcribe():
             file.save(tmp.name)
             tmp_path = tmp.name
         # Run ASL inference using the structured clip transcription path.
-        result = transcribe_video_details(tmp_path)
+        result = transcribe_video_details(tmp_path, top_k=3)
     except Exception as e:
         return jsonify({"error": str(e)}), 500
     finally:
@@ -482,10 +484,19 @@ def asl_transcribe():
     except Exception:
         pass
 
+    top_predictions = list(result.get("top_predictions", []))[:3]
     response_payload = {
         "text": result.get("text", ""),
         "best_prediction": result.get("best_prediction"),
-        "top_predictions": result.get("top_predictions", []),
+        "top_predictions": top_predictions,
+        "predictions": [
+            {
+                "word": prediction.get("label"),
+                "confidence": prediction.get("confidence"),
+                "index": prediction.get("index"),
+            }
+            for prediction in top_predictions
+        ],
         "frames_processed": result.get("frames_processed", 0),
         "windows_evaluated": result.get("windows_evaluated", 0),
     }

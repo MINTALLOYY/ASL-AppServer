@@ -15,16 +15,16 @@ def get_predictor() -> "ASLPredictor":
     return _predictor
 
 
-def transcribe_video(file_path: str) -> str:
+def transcribe_video(file_path: str, top_k: int = 3) -> str:
     """Transcribe an ASL video file to text using the shared predictor."""
-    return transcribe_video_details(file_path).get("text", "")
+    return transcribe_video_details(file_path, top_k=top_k).get("text", "")
 
 
-def transcribe_video_details(file_path: str) -> dict:
+def transcribe_video_details(file_path: str, top_k: int = 3) -> dict:
     """Return a structured ASL transcription payload for a video file."""
     predictor = get_predictor()
     predictor.reset()
     try:
-        return predictor.transcribe_video_file(file_path)
+        return predictor.transcribe_video_file(file_path, top_k=top_k)
     finally:
         predictor.reset()
