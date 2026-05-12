@@ -65,6 +65,20 @@ class ASLPredictor:
         rh = lm(result.right_hand_landmarks, 21)
         return np.concatenate([pose, lh, rh], axis=0).flatten()
 
+    def _normalize_landmarks(self, flat_landmarks: np.ndarray) -> np.ndarray:
+        points = flat_landmarks.reshape(-1, 2).astype(np.float32)
+        pose = points[:13]
+
+        left_shoulder = pose[11]
+        right_shoulder = pose[12]
+        center = (left_shoulder + right_shoulder) / 2.0
+        scale = np.linalg.norm(left_shoulder - right_shoulder)
+        if not np.isfinite(scale) or scale < 1e-6:
+            scale = 1.0
+
+        points = (points - center) / scale
+        return points.flatten()
+
     def _predict_from_seq(self, seq: np.ndarray) -> np.ndarray:
         """seq: (SEQ_LEN, 110) -> probability array"""
         x_data = seq.flatten().reshape(1, -1)
@@ -122,14 +136,17 @@ class ASLPredictor:
                 "windows_selected": 0,
             }
 
-        pre_sample_n = min(len(rgb_frames), 100)
+        pre_sample_n = min(len(rgb_frames), 60)
         if len(rgb_frames) > pre_sample_n:
             idx = np.linspace(0, len(rgb_frames) - 1, pre_sample_n, dtype=int)
             sampled = [rgb_frames[i] for i in idx]
         else:
             sampled = rgb_frames
 
-        all_lm = np.array([self._extract_landmarks(frame) for frame in sampled], dtype=np.float32)
+        all_lm = np.array(
+            [self._normalize_landmarks(self._extract_landmarks(frame)) for frame in sampled],
+            dtype=np.float32,
+        )
         seq = self._select_most_informative_window(all_lm)
         probs = self._predict_from_seq(seq)
         top_preds = self._top_predictions(probs, top_k)
