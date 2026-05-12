@@ -13,7 +13,7 @@ class TestGoogleCredentials(unittest.TestCase):
         load_dotenv()
         print(os.environ)
         username = os.environ.get("USER_NAME")
-        print("\n[TEST] USERNAME: " + username)
+        print(f"\n[TEST] USERNAME: {username}")
         """Test if GOOGLE_APPLICATION_CREDENTIALS environment variable is set."""
         creds_path = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS")
         print(f"\n[TEST] GOOGLE_APPLICATION_CREDENTIALS: {creds_path}")
