@@ -5,9 +5,11 @@ import platform
 import sys
 import tempfile
 
+import config
 from asl.asl_inference import get_predictor as config_get_predictor
 from asl.asl_inference import transcribe_video_details as config_transcribe_video_details
 from config import db as config_db
+from utils import _get_accessor_uuid, normalize_uuid, validate_uuid
 
 logger = logging.getLogger(__name__)
 
@@ -97,6 +99,12 @@ def asl_transcribe():
         Error 500 if transcription fails.
     """
     conversation_id = request.form.get("conversation_id")
+    accessor_uuid = _get_accessor_uuid(request)
+    if accessor_uuid is None and config.ENFORCE_CONVERSATION_UUID:
+        return jsonify({"error": "missing_conversation_uuid"}), 400
+    if accessor_uuid is not None and not validate_uuid(accessor_uuid):
+        return jsonify({"error": "invalid_uuid"}), 400
+    accessor_uuid = normalize_uuid(accessor_uuid) if accessor_uuid else None
     file = request.files.get("video")
     if not file:
         return jsonify({"error": "video file is required (form field 'video')"}), 400
@@ -128,13 +136,6 @@ def asl_transcribe():
         except Exception:
             pass
 
-    # Save result to Firestore if conversation_id provided and db is initialized
-    try:
-        if conversation_id and result.get("text") and db:
-            db.save_message(conversation_id=conversation_id, text=result["text"], source="asl")
-    except Exception:
-        pass
-
     top_predictions = list(result.get("top_predictions", []))[:3]
     response_payload = {
         "text": result.get("text", ""),
@@ -151,4 +152,6 @@ def asl_transcribe():
         "frames_processed": result.get("frames_processed", 0),
         "windows_evaluated": result.get("windows_evaluated", 0),
     }
+    if accessor_uuid:
+        response_payload["conversation_uuid"] = accessor_uuid
     return jsonify(response_payload)

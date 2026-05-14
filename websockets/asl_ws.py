@@ -5,7 +5,8 @@ import logging
 from flask import request
 from typing import Optional
 from asl.asl_inference import get_predictor
-from config import db
+import config
+from utils import _get_accessor_uuid, normalize_uuid, validate_uuid
 
 logger = logging.getLogger(__name__)
 
@@ -22,7 +23,7 @@ def register_asl_ws(sock):
         on landmark windows, and sends predicted words back to the client.
 
         Query parameters:
-            - conversation_id (optional): Firestore conversation ID to persist ASL results.
+            - conversation_uuid (optional): account-scoped user identifier.
         Expected client events:
             - {"event": "asl_frame", "frame": "<base64 JPEG>"}
             - {"event": "reset"}     # clear predictor buffer
@@ -36,8 +37,15 @@ def register_asl_ws(sock):
         conn_started_at = time.time()
         conn_id = f"aslws-{int(conn_started_at * 1000)}-{(id(ws) % 100000)}"
         remote = request.remote_addr
-        conversation_id: Optional[str] = request.args.get("conversation_id")
-        logger.info("[%s] OPEN remote=%s path=/asl/ws conversation_id=%s", conn_id, remote, conversation_id)
+        conversation_uuid_raw = request.args.get("conversation_uuid") or _get_accessor_uuid(request)
+        if conversation_uuid_raw is not None and not validate_uuid(conversation_uuid_raw):
+            ws.send(json.dumps({"event": "error", "message": "invalid_uuid"}))
+            return
+        if conversation_uuid_raw is None and config.ENFORCE_CONVERSATION_UUID:
+            ws.send(json.dumps({"event": "error", "message": "missing_conversation_uuid"}))
+            return
+        conversation_uuid: Optional[str] = normalize_uuid(conversation_uuid_raw) if conversation_uuid_raw else None
+        logger.info("[%s] OPEN remote=%s path=/asl/ws conversation_uuid=%s", conn_id, remote, conversation_uuid)
 
         # Ack immediately so clients are not stuck waiting while model loads.
         ws.send(json.dumps({"event": "connected"}))
@@ -160,11 +168,6 @@ def register_asl_ws(sock):
                         predictions_sent += 1
                         ws.send(json.dumps({"event": "asl_result", "word": word}))
                         logger.info("[%s] TX asl_result word=%s total_predictions=%s", conn_id, word, predictions_sent)
-                        try:
-                            if conversation_id and db:
-                                db.save_message(conversation_id=conversation_id, text=word, source="asl")
-                        except Exception as _db_err:
-                            logger.error("[%s] Firestore save error (asl_result): %s", conn_id, _db_err)
 
                 elif event == "reset":
                     predictor.reset()

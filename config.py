@@ -41,6 +41,17 @@ session_modes: dict[str, str] = {}
 # Keys: conversation_id, Values: set of labels (e.g. {'Speaker_1', 'Speaker_2'})
 identified_labels: dict[str, set] = {}
 
+# Feature flag for staged rollout of account-scoped ID enforcement.
+ENFORCE_ACCESSOR_ID = os.environ.get("ENFORCE_ACCESSOR_ID", os.environ.get("ENFORCE_CONVERSATION_UUID", "")).strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
+
+# Backwards-compatible alias for older code paths and tests.
+ENFORCE_CONVERSATION_UUID = ENFORCE_ACCESSOR_ID
+
 from firebase.db import FirestoreDB
 
 FIREBASE_PROJECT_ID = (

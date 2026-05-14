@@ -5,6 +5,8 @@ import json
 import unittest
 from unittest.mock import MagicMock, patch
 
+VALID_UUID = "123e4567-e89b-42d3-a456-426614174000"
+
 
 # Patch external/heavy dependencies before importing app.
 with patch("speech.chirp_stream.ChirpStreamer"), \
@@ -19,7 +21,10 @@ class TestEndpointSmoke(unittest.TestCase):
     def setUp(self):
         self.client = server_app.app.test_client()
         self.mock_db = MagicMock()
-        self.mock_db.create_conversation.return_value = "cid-smoke"
+        self.mock_db.create_conversation.return_value = {
+            "conversation_id": "cid-smoke",
+            "conversation_uuid": VALID_UUID,
+        }
         self.mock_db.list_conversations.return_value = []
         self.mock_db.get_conversation.return_value = None
         self.mock_db.get_messages.return_value = []
@@ -80,16 +85,20 @@ class TestEndpointSmoke(unittest.TestCase):
         self.assertIn("ws_speech_url", body)
 
     def test_conversation_endpoints_callable(self):
-        created = self.client.post("/conversations", data=json.dumps({}), content_type="application/json")
+        created = self.client.post(
+            "/conversations",
+            data=json.dumps({"conversation_uuid": VALID_UUID}),
+            content_type="application/json",
+        )
         self.assertEqual(created.status_code, 201)
 
-        listed = self.client.get("/conversations")
+        listed = self.client.get(f"/conversations?conversation_uuid={VALID_UUID}")
         self.assertEqual(listed.status_code, 200)
 
-        fetched = self.client.get("/conversations/does-not-exist")
+        fetched = self.client.get(f"/conversations/does-not-exist?conversation_uuid={VALID_UUID}")
         self.assertIn(fetched.status_code, {404, 500})
 
-        messages = self.client.get("/conversations/does-not-exist/messages")
+        messages = self.client.get(f"/conversations/does-not-exist/messages?conversation_uuid={VALID_UUID}")
         self.assertEqual(messages.status_code, 200)
 
     def test_speech_endpoints_callable(self):
@@ -101,6 +110,7 @@ class TestEndpointSmoke(unittest.TestCase):
             data=json.dumps(
                 {
                     "conversation_id": "cid-smoke",
+                    "conversation_uuid": VALID_UUID,
                     "speakers": [{"label": "Speaker_0", "name": "Alex"}],
                 }
             ),
@@ -108,7 +118,7 @@ class TestEndpointSmoke(unittest.TestCase):
         )
         self.assertEqual(register.status_code, 200)
 
-        lookup = self.client.get("/speech/register_speakers?conversation_id=cid-smoke")
+        lookup = self.client.get(f"/speech/register_speakers?conversation_id=cid-smoke&conversation_uuid={VALID_UUID}")
         self.assertEqual(lookup.status_code, 200)
 
     def test_asl_endpoints_callable(self):
@@ -120,7 +130,7 @@ class TestEndpointSmoke(unittest.TestCase):
 
         with_file = self.client.post(
             "/asl/transcribe",
-            data={"video": (io.BytesIO(b"fake-bytes"), "clip.mp4")},
+            data={"conversation_uuid": VALID_UUID, "video": (io.BytesIO(b"fake-bytes"), "clip.mp4")},
             content_type="multipart/form-data",
         )
         self.assertEqual(with_file.status_code, 200)
